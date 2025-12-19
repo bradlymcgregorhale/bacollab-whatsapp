@@ -196,13 +196,15 @@ async function submitSolicitud(data) {
   console.log('Step 1: Navigating to recoleccion de residuos page...');
   await page.goto(URLS.recoleccionResiduos, { waitUntil: 'networkidle2', timeout: 60000 });
   await delay(2000);
+  console.log('Current URL after Step 1:', page.url());
 
-  // Step 2: Click "Confirmar" button
-  console.log('Step 2: Clicking Confirmar...');
-  await page.evaluate(() => {
+  // Step 2: Click "Confirmar" button (if present)
+  console.log('Step 2: Looking for Confirmar button...');
+  const confirmarClicked = await page.evaluate(() => {
     const buttons = document.querySelectorAll('button');
     for (const btn of buttons) {
       if ((btn.textContent || '').includes('Confirmar')) {
+        console.log('Found Confirmar button, clicking...');
         btn.click();
         return true;
       }
@@ -210,35 +212,126 @@ async function submitSolicitud(data) {
     return false;
   });
 
-  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-  await delay(2000);
+  console.log('Confirmar button clicked:', confirmarClicked);
+
+  if (confirmarClicked) {
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {
+      console.log('Navigation after Confirmar timed out, continuing...');
+    });
+    await delay(2000);
+  } else {
+    // If no Confirmar button, we might already be on ubicacion page or need to navigate directly
+    console.log('No Confirmar button found, checking if we need to navigate to ubicacion...');
+    const currentUrl = page.url();
+    if (!currentUrl.includes('ubicacion')) {
+      console.log('Navigating directly to ubicacion page...');
+      await page.goto(URLS.ubicacion, { waitUntil: 'networkidle2', timeout: 60000 });
+      await delay(2000);
+    }
+  }
+
+  console.log('Current URL after Step 2:', page.url());
 
   // Step 3: Enter address
   console.log('Step 3: Entering address...');
-  await delay(2000); // Wait for page to fully load
+  console.log('Current URL:', page.url());
+
+  // Wait for Angular app to load and the autocomplete component to be ready
+  console.log('Waiting for address input to appear...');
+  try {
+    await page.waitForSelector('ng-autocomplete input, input[placeholder*="Lugar"], input[role="combobox"]', {
+      timeout: 15000,
+      visible: true
+    });
+    console.log('Address input selector found');
+  } catch (e) {
+    console.log('Timeout waiting for address input selector');
+  }
+
+  await delay(1000); // Brief delay for Angular to finish binding
+
+  // Debug: Take screenshot and log all input elements
+  await page.screenshot({ path: 'debug-before-address-input.png', fullPage: true });
+  const inputsInfo = await page.evaluate(() => {
+    const inputs = document.querySelectorAll('input');
+    return Array.from(inputs).map(i => ({
+      type: i.type,
+      placeholder: i.placeholder,
+      ariaLabel: i.getAttribute('aria-label'),
+      role: i.role,
+      id: i.id,
+      className: i.className,
+      name: i.name
+    }));
+  });
+  console.log('Available inputs on page:', JSON.stringify(inputsInfo, null, 2));
+
   const addressInput = await page.$('input[placeholder*="Lugar de tu solicitud"]') ||
                        await page.$('input[aria-label*="Lugar de tu solicitud"]') ||
                        await page.$('input[placeholder*="Uspallata"]') ||
                        await page.$('ng-autocomplete input[type="text"]') ||
-                       await page.$('input[role="combobox"]');
+                       await page.$('.autocomplete-container input[type="text"]') ||
+                       await page.$('input[role="combobox"]') ||
+                       await page.$('input[placeholder*="dirección"]') ||
+                       await page.$('input[placeholder*="ubicación"]') ||
+                       await page.$('input[placeholder*="calle"]');
 
   if (!addressInput) {
     await page.screenshot({ path: 'debug-no-address-input.png', fullPage: true });
-    throw new Error('Address input not found');
+    throw new Error('Address input not found - check debug-before-address-input.png and console logs for available inputs');
   }
 
-  await addressInput.click();
-  await addressInput.type(address, { delay: 50 });
+  // Clear any existing text and focus the input
+  await addressInput.click({ clickCount: 3 }); // Triple-click to select all
+  await page.keyboard.press('Backspace');
+  await delay(500);
+
+  // Type the address slowly to allow autocomplete to respond
+  console.log(`Typing address: ${address}`);
+  await addressInput.type(address, { delay: 100 }); // Slower typing
 
   // Wait for suggestions to appear
-  console.log('Waiting for address suggestions...');
-  await delay(2000);
-
-  // Wait for suggestions to appear and become visible
   console.log('Step 4: Waiting for suggestions to appear...');
-  await page.waitForSelector('#suggestions.is-visible li.item', { timeout: 10000 }).catch(() => {
-    console.log('Suggestions selector timeout, trying anyway...');
+  await delay(1500); // Initial delay for API response
+
+  // Try waiting for suggestions with multiple selectors
+  const suggestionSelectors = [
+    '#suggestions.is-visible li.item',
+    '#suggestions ul li.item',
+    '.suggestions-container.is-visible li',
+    '#suggestions li'
+  ];
+
+  let suggestionsFound = false;
+  for (const selector of suggestionSelectors) {
+    try {
+      await page.waitForSelector(selector, { timeout: 5000, visible: true });
+      console.log(`Suggestions found with selector: ${selector}`);
+      suggestionsFound = true;
+      break;
+    } catch (e) {
+      // Try next selector
+    }
+  }
+
+  if (!suggestionsFound) {
+    console.log('No suggestions appeared, waiting a bit longer...');
+    await delay(3000);
+  }
+
+  // Debug: Check what's in the suggestions container
+  const suggestionsDebug = await page.evaluate(() => {
+    const container = document.getElementById('suggestions');
+    if (container) {
+      return {
+        className: container.className,
+        innerHTML: container.innerHTML.substring(0, 500),
+        childCount: container.querySelectorAll('li').length
+      };
+    }
+    return { error: 'No suggestions container found' };
   });
+  console.log('Suggestions state:', JSON.stringify(suggestionsDebug, null, 2));
 
   await page.screenshot({ path: 'debug-suggestions-visible.png', fullPage: true });
 
@@ -256,32 +349,32 @@ async function submitSolicitud(data) {
 
     for (const sel of selectors) {
       const suggestions = document.querySelectorAll(sel);
-      console.log(`Trying selector "${sel}", found ${suggestions.length} items`);
       if (suggestions.length > 0) {
         // Try clicking the first item
         const firstItem = suggestions[0];
-        console.log('Clicking suggestion:', firstItem.textContent);
+        const text = firstItem.textContent || '';
+        console.log('Found suggestion:', text);
 
         // Try clicking the anchor inside first
         const anchor = firstItem.querySelector('a.titulo-sugerencia');
         if (anchor) {
           anchor.click();
-          return { success: true, method: 'anchor click' };
+          return { success: true, method: 'anchor click', text };
         }
 
         // Try clicking the div inside
         const div = firstItem.querySelector('div');
         if (div) {
           div.click();
-          return { success: true, method: 'div click' };
+          return { success: true, method: 'div click', text };
         }
 
         // Click the li itself
         firstItem.click();
-        return { success: true, method: 'li click' };
+        return { success: true, method: 'li click', text };
       }
     }
-    return { success: false };
+    return { success: false, selectors: selectors.map(s => ({s, count: document.querySelectorAll(s).length})) };
   });
 
   console.log('Suggestion click result:', suggestionClicked);
