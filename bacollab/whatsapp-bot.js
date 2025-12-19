@@ -148,22 +148,22 @@ class TrashReportBot {
       }
 
       const senderId = msg.author || msg.from;
-      let contact = null;
       let senderName = 'Vecino';
+      // Extract phone number from senderId for mentions (e.g., "5491123456789" from "5491123456789@c.us")
+      const senderPhone = senderId.split('@')[0];
 
       try {
-        contact = await msg.getContact();
-        senderName = contact.pushname || contact.name || 'Vecino';
+        const contact = await msg.getContact();
+        senderName = contact.pushname || contact.name || senderPhone;
       } catch (e) {
-        console.log(`  [Warn] No se pudo obtener contacto: ${e.message}`);
+        // Use phone number as fallback name
+        senderName = senderPhone;
       }
 
-      // Cache the chat and contact for later use
+      // Cache the chat and senderId for later use (for mentions)
       this.chatCache.set(senderId, chat);
-      this.contactCache = this.contactCache || new Map();
-      if (contact) {
-        this.contactCache.set(senderId, contact);
-      }
+      this.senderIdCache = this.senderIdCache || new Map();
+      this.senderIdCache.set(senderId, { senderId, senderPhone, senderName });
 
       console.log(`\n[${new Date().toLocaleTimeString()}] Mensaje de ${senderName}:`);
       console.log(`  Texto: ${msg.body || '(sin texto)'}`);
@@ -274,9 +274,10 @@ class TrashReportBot {
 
       // If we need to respond (problem to communicate)
       if (extraction.shouldRespond && extraction.response) {
-        const contact = this.contactCache?.get(senderId);
-        const mentions = contact ? [contact] : [];
-        await chat.sendMessage(`@${pending.senderName} ${extraction.response}`, { mentions });
+        const senderInfo = this.senderIdCache?.get(senderId);
+        const mentions = senderInfo ? [senderInfo.senderId] : [];
+        const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+        await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions });
         console.log(`  [Bot] @${pending.senderName} ${extraction.response}`);
         // Reset messages but keep for follow-up
         pending.messages = [];
@@ -294,10 +295,11 @@ class TrashReportBot {
       // We have valid requests - queue them directly (no confirmation needed)
       if (extraction.requests && extraction.requests.length > 0) {
         // Acknowledge the request
-        const contact = this.contactCache?.get(senderId);
-        const mentions = contact ? [contact] : [];
+        const senderInfo = this.senderIdCache?.get(senderId);
+        const mentions = senderInfo ? [senderInfo.senderId] : [];
+        const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
         const addresses = extraction.requests.map(r => r.address).join(', ');
-        await chat.sendMessage(`@${pending.senderName} Ya mando la solicitud para ${addresses}...`, { mentions });
+        await chat.sendMessage(`${mentionText} Ya mando la solicitud para ${addresses}...`.trim(), { mentions });
         console.log(`  [Bot] Procesando: ${addresses}`);
 
         for (const req of extraction.requests) {
@@ -317,6 +319,7 @@ class TrashReportBot {
             senderId,
             senderName: pending.senderName,
             address: req.address,
+            reportType: req.reportType || 'recoleccion',
             containerType: req.containerType || 'negro',
             photo,
             chat
@@ -325,7 +328,8 @@ class TrashReportBot {
 
         console.log(`  Queued ${extraction.requests.length} request(s)`);
         for (const req of extraction.requests) {
-          console.log(`    - ${req.address} (msgIndex: ${req.msgIndex || 'auto'}, foto: ${req.photo ? 'sí' : 'no'})`);
+          const reportTypeLabel = req.reportType === 'barrido' ? 'barrido' : 'recoleccion';
+          console.log(`    - ${req.address} (tipo: ${reportTypeLabel}, msgIndex: ${req.msgIndex || 'auto'}, foto: ${req.photo ? 'sí' : 'no'})`);
         }
 
         // Clear pending messages for this user
@@ -405,7 +409,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-haiku-4-20250514',
+            model: 'claude-3-5-haiku-20241022',
             max_tokens: 500,
             system: getSystemPrompt(),
             messages: [{ role: 'user', content }]
@@ -472,16 +476,21 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
   }
 
   async submitRequest(request) {
-    const { senderId, senderName, address, containerType, photo, chat } = request;
-    const contact = this.contactCache?.get(senderId);
-    const mentions = contact ? [contact] : [];
+    const { senderId, senderName, address, reportType = 'recoleccion', containerType, photo, chat } = request;
+    const senderInfo = this.senderIdCache?.get(senderId);
+    const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
+    const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : `@${senderId.split('@')[0]}`;
+    const reportTypeName = reportType === 'barrido' ? 'Mejora de barrido' : 'Recolección de residuos';
 
     console.log('\n========================================');
     console.log('  ENVIANDO SOLICITUD');
     console.log(`  Vecino: ${senderName}`);
     console.log(`  Dirección: ${address}`);
+    console.log(`  Tipo de reporte: ${reportTypeName}`);
     console.log(`  Foto: ${photo ? 'Sí' : 'No'}`);
-    console.log(`  Tipo: ${containerType}`);
+    if (reportType === 'recoleccion') {
+      console.log(`  Contenedor: ${containerType}`);
+    }
     console.log('========================================\n');
 
     try {
@@ -491,6 +500,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           address,
+          reportType,
           containerType,
           photos: photo ? [photo] : []
         })
@@ -509,15 +519,15 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         fs.appendFileSync(REPORTS_LOG, csvLine);
         console.log(`  [Log] Guardado en reports.csv`);
 
-        const successMsg = `@${senderName} Listo, mandé la solicitud para ${address}. #${result.solicitudNumber}\n${solicitudUrl}`;
+        const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}. #${result.solicitudNumber}\n${solicitudUrl}`;
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada: #${result.solicitudNumber}`);
       } else if (result.success) {
-        const successMsg = `@${senderName} Listo, mandé la solicitud para ${address}.`;
+        const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}.`;
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada (sin número)`);
       } else {
-        await chat.sendMessage(`@${senderName} No pude mandar la solicitud para ${address}. Intentá de nuevo.`, { mentions });
+        await chat.sendMessage(`${mentionText} No pude mandar la solicitud para ${address}. Intentá de nuevo.`, { mentions });
         console.log(`  [Bot] Error: ${result.error}`);
       }
 
@@ -674,6 +684,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
               senderId,
               senderName,
               address: req.address,
+              reportType: req.reportType || 'recoleccion',
               containerType: req.containerType || 'negro',
               photo,
               chat: targetChat

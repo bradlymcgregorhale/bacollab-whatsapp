@@ -19,7 +19,14 @@ let isLoggedIn = false;
 const URLS = {
   prestaciones: 'https://bacolaborativa.buenosaires.gob.ar/prestaciones',
   recoleccionResiduos: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1462821007742',
+  mejoraBarrido: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/096059',
   ubicacion: 'https://bacolaborativa.buenosaires.gob.ar/ubicacion'
+};
+
+// Report types
+const REPORT_TYPES = {
+  recoleccion: 'recoleccionResiduos',  // Trash around containers
+  barrido: 'mejoraBarrido'              // Dirt/trash on street/curbs
 };
 
 const SELECTORS = {
@@ -179,7 +186,7 @@ async function login() {
 }
 
 async function submitSolicitud(data) {
-  const { address, containerType = 'negro', description = '' } = data;
+  const { address, containerType = 'negro', description = '', reportType = 'recoleccion' } = data;
 
   if (!isLoggedIn) {
     const loginSuccess = await login();
@@ -190,11 +197,17 @@ async function submitSolicitud(data) {
 
   const { page } = await initBrowser();
 
-  console.log(`Submitting solicitud for address: ${address}`);
+  // Determine which URL to use based on report type
+  const urlKey = REPORT_TYPES[reportType] || 'recoleccionResiduos';
+  const targetUrl = URLS[urlKey];
+  const reportTypeName = reportType === 'barrido' ? 'Mejora de barrido' : 'Recolección de residuos';
 
-  // Step 1: Go to recoleccion de residuos confirmation page
-  console.log('Step 1: Navigating to recoleccion de residuos page...');
-  await page.goto(URLS.recoleccionResiduos, { waitUntil: 'networkidle2', timeout: 60000 });
+  console.log(`Submitting solicitud for address: ${address}`);
+  console.log(`Report type: ${reportTypeName}`);
+
+  // Step 1: Go to confirmation page for the appropriate report type
+  console.log(`Step 1: Navigating to ${reportTypeName} page...`);
+  await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
   await delay(2000);
   console.log('Current URL after Step 1:', page.url());
 
@@ -447,43 +460,47 @@ async function submitSolicitud(data) {
 
   await page.screenshot({ path: 'debug-after-nueva-solicitud.png', fullPage: true });
 
-  // Step 6: Fill the questionnaire - select container type
-  console.log('Step 6: Selecting container type...');
+  // Step 6 & 7: Only for 'recoleccion' type - fill questionnaire and click Siguiente
+  if (reportType === 'recoleccion') {
+    console.log('Step 6: Selecting container type...');
 
-  await page.screenshot({ path: 'debug-questionnaire.png', fullPage: true });
+    await page.screenshot({ path: 'debug-questionnaire.png', fullPage: true });
 
-  // Click the radio button for container type
-  const radioClicked = await page.evaluate((type) => {
-    // Try clicking the label directly (more reliable)
-    const labels = document.querySelectorAll('label.form-radio-label');
-    for (const label of labels) {
-      const text = label.textContent || '';
-      if (type === 'verde' && text.includes('reciclables')) {
-        label.click();
-        return { success: true, text };
+    // Click the radio button for container type
+    const radioClicked = await page.evaluate((type) => {
+      // Try clicking the label directly (more reliable)
+      const labels = document.querySelectorAll('label.form-radio-label');
+      for (const label of labels) {
+        const text = label.textContent || '';
+        if (type === 'verde' && text.includes('reciclables')) {
+          label.click();
+          return { success: true, text };
+        }
+        if (type === 'negro' && text.includes('húmedos')) {
+          label.click();
+          return { success: true, text };
+        }
       }
-      if (type === 'negro' && text.includes('húmedos')) {
-        label.click();
-        return { success: true, text };
+      // Fallback to radio button IDs
+      const radioId = type === 'verde' ? 'respuesta45731' : 'respuesta45732';
+      const radio = document.getElementById(radioId);
+      if (radio) {
+        radio.click();
+        return { success: true, method: 'radio id' };
       }
-    }
-    // Fallback to radio button IDs
-    const radioId = type === 'verde' ? 'respuesta45731' : 'respuesta45732';
-    const radio = document.getElementById(radioId);
-    if (radio) {
-      radio.click();
-      return { success: true, method: 'radio id' };
-    }
-    return { success: false };
-  }, containerType);
+      return { success: false };
+    }, containerType);
 
-  console.log('Radio click result:', radioClicked);
-  await delay(1000);
+    console.log('Radio click result:', radioClicked);
+    await delay(1000);
 
-  // Step 7: Click Siguiente inside the questionnaire accordion
-  console.log('Step 7: Clicking Siguiente in questionnaire section...');
-  await clickAccordionSiguiente(page, '#collapseCuestionario');
-  await delay(2000);
+    // Step 7: Click Siguiente inside the questionnaire accordion
+    console.log('Step 7: Clicking Siguiente in questionnaire section...');
+    await clickAccordionSiguiente(page, '#collapseCuestionario');
+    await delay(2000);
+  } else {
+    console.log('Step 6-7: Skipping questionnaire (not required for barrido)');
+  }
 
   // Step 8: Description section - click Siguiente inside that accordion
   console.log('Step 8: Clicking Siguiente in description section...');
@@ -767,13 +784,14 @@ app.post('/login', async (req, res) => {
 // Submit solicitud endpoint
 app.post('/solicitud', async (req, res) => {
   try {
-    const { address, containerType, description, photos } = req.body;
+    const { address, containerType, description, photos, reportType } = req.body;
 
     if (!address) {
       return res.status(400).json({ success: false, error: 'Address is required' });
     }
 
-    const result = await submitSolicitud({ address, containerType, description, photos });
+    console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"`);
+    const result = await submitSolicitud({ address, containerType, description, photos, reportType });
 
     // Close browser after successful submission
     await closeBrowser();
