@@ -56,65 +56,23 @@ const MESSAGE_RETENTION_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 // Debounce time - wait for user to finish sending messages
 const DEBOUNCE_MS = 3000;
+// Longer debounce when we have photos but no address yet
+const DEBOUNCE_PHOTO_MS = 8000;
+// Max messages to wait before asking for address
+const MAX_MESSAGES_BEFORE_ASK = 5;
 
-// System prompt for Claude - extraction focused, quiet in group chat
-const SYSTEM_PROMPT = `Sos Bradly de Buenos Vecinos BA. Monitoreás un grupo de WhatsApp donde vecinos reportan basura ALREDEDOR DE CONTENEDORES de Buenos Aires.
+// System prompt file path - loaded on each request for hot-reload
+const SYSTEM_PROMPT_FILE = path.join(__dirname, 'system-prompt.txt');
 
-IMPORTANTE: Este sistema es SOLO para reportar basura alrededor de contenedores de CABA (los contenedores negros/grises grandes de la ciudad). NO es para:
-- Muebles abandonados (sillones, colchones, etc.)
-- Basura en veredas sin contenedor
-- Escombros
-- Otros tipos de residuos voluminosos
-
-ANÁLISIS DE FOTOS - REQUISITO: DEBE verse un contenedor de CABA
-- Foto con contenedor negro/gris de CABA + basura afuera/desbordando → ES UN REPORTE VÁLIDO
-- Foto con contenedor verde de reciclables + basura afuera → ES UN REPORTE VÁLIDO
-- Foto SIN contenedor visible (solo basura, muebles, etc.) → NO ES VÁLIDO, explicar amablemente
-- Foto de mueble/sillón/colchón abandonado → NO ES VÁLIDO, decir que este sistema no maneja eso
-
-Si la foto NO muestra un contenedor de CABA:
-- Si hay dirección clara pero foto sin contenedor → shouldRespond: true, pedir mejor foto
-- Si NO hay dirección (solo foto random, texto sin sentido como "????") → shouldRespond: false, IGNORAR completamente
-
-IMPORTANTE - ESTO ES UN GRUPO:
-- NO respondas a saludos, conversaciones generales, quejas sin dirección, etc.
-- Solo respondé si alguien CLARAMENTE quiere reportar basura Y le falta la dirección
-- Si no hay nada actionable, respondé con shouldRespond: false y callate
-
-DETECTAR INTENCIÓN:
-- "Hay basura en el contenedor de Pasteur 415" + foto con contenedor → ACTIONABLE
-- Foto de contenedor desbordado + dirección → ACTIONABLE
-- Foto de contenedor desbordado sin dirección → Pedir dirección
-- Foto sin contenedor visible → Explicar que necesitás ver el contenedor
-- "Hola" / "Qué onda" / "No" → NO ACTIONABLE, ignorar
-- "Qué sucio está todo" / "Nadie limpia" → Queja general, ignorar
-- Conversación entre vecinos → Ignorar
-
-EXTRAER:
-1. DIRECCIONES: Todas las que mencionen (ej: "Pasteur 415", "Av. Corrientes 1234")
-2. TIPO: "verde" (reciclables) o "negro" (húmedos) - default "negro"
-
-FORMATO JSON:
-{
-  "shouldRespond": true/false,
-  "requests": [{"address": "dirección completa", "containerType": "negro", "msgIndex": 1}],
-  "response": "solo si shouldRespond es true Y hay un problema (falta foto válida, falta dirección, etc.)"
+// Function to load system prompt from file (allows hot-reload without restart)
+function getSystemPrompt() {
+  try {
+    return fs.readFileSync(SYSTEM_PROMPT_FILE, 'utf-8');
+  } catch (e) {
+    console.error('Error loading system-prompt.txt:', e.message);
+    return 'Extract addresses from messages and respond in JSON format.';
+  }
 }
-
-NOTA: msgIndex indica qué mensaje tiene la foto correcta para ese reporte (ej: si Msg2 tiene la foto del contenedor para esa dirección, msgIndex: 2)
-
-ALIAS DE CALLES - Usá el nombre completo:
-- "Uriburu" → "Pres. José Evaristo Uriburu"
-- "Peron" / "Perón" → "Tte. Gral. Juan Domingo Perón"
-- "Mitre" → "Bartolomé Mitre"
-- "Corrientes" → "Av. Corrientes"
-- "Callao" → "Av. Callao"
-
-REGLAS:
-- shouldRespond: false para TODO lo que no sea un reporte claro o casi-claro
-- Si hay foto válida (con contenedor) + dirección completa: NO respondas nada, solo devolvé requests con shouldRespond: false
-- shouldRespond: true SOLO si hay un problema que comunicar (falta foto válida, falta dirección, foto sin contenedor, etc.)
-- Sos un vecino, no un bot. Si respondés, hablá normal y corto`;
 
 class TrashReportBot {
   constructor() {
@@ -122,11 +80,16 @@ class TrashReportBot {
       authStrategy: new LocalAuth(),
       puppeteer: {
         headless: true,
+        timeout: 60000,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-gpu',
-          '--disable-dev-shm-usage'
+          '--disable-dev-shm-usage',
+          '--disable-software-rasterizer',
+          '--disable-extensions',
+          '--no-first-run',
+          '--single-process' // Important for low-resource servers
         ]
       }
     });
@@ -136,6 +99,15 @@ class TrashReportBot {
   }
 
   setupEventHandlers() {
+    // Debug events to track initialization
+    this.client.on('auth_failure', msg => {
+      console.log('[DEBUG] Auth failure:', msg);
+    });
+
+    this.client.on('change_state', state => {
+      console.log('[DEBUG] State changed:', state);
+    });
+
     this.client.on('qr', qr => {
       console.log('\n========================================');
       console.log('  Escaneá este código QR con WhatsApp');
@@ -244,7 +216,8 @@ class TrashReportBot {
           messages: [],
           timer: null,
           senderName,
-          chatId: chat.id._serialized
+          chatId: chat.id._serialized,
+          hasAskedForAddress: false
         };
         pendingMessages.set(senderId, pending);
       }
@@ -257,10 +230,21 @@ class TrashReportBot {
       // Add this message to pending
       pending.messages.push(messageObj);
 
+      // Smart debounce: wait longer if we have photos but no text with potential address
+      const hasPhotos = pending.messages.some(m => m.photo);
+      const hasTextWithNumbers = pending.messages.some(m => m.text && /\d+/.test(m.text));
+
+      // Use longer debounce if we have photos but no address-like text yet
+      const debounceTime = (hasPhotos && !hasTextWithNumbers) ? DEBOUNCE_PHOTO_MS : DEBOUNCE_MS;
+
+      if (hasPhotos && !hasTextWithNumbers) {
+        console.log(`  [Debounce] Foto sin dirección detectada, esperando ${debounceTime/1000}s...`);
+      }
+
       // Set debounce timer - wait for more messages before processing
       pending.timer = setTimeout(async () => {
         await this.processPendingMessages(senderId);
-      }, DEBOUNCE_MS);
+      }, debounceTime);
 
     } catch (error) {
       console.error('Error handling message:', error);
@@ -421,9 +405,9 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-20250514',
+            model: 'claude-haiku-4-20250514',
             max_tokens: 500,
-            system: SYSTEM_PROMPT,
+            system: getSystemPrompt(),
             messages: [{ role: 'user', content }]
           });
 
@@ -721,16 +705,27 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     console.log('[DEBUG] Platform:', process.platform);
     console.log('[DEBUG] Node version:', process.version);
 
-    // Kill any existing whatsapp-bot processes (except this one)
+    // Kill any existing whatsapp-bot processes and zombie Chrome/Chromium
     console.log('[0/4] Limpiando procesos anteriores...');
     const { execSync } = await import('child_process');
+
+    // Kill zombie Chrome/Chromium processes first
+    try {
+      execSync('pkill -9 -f "chrome.*whatsapp-web" 2>/dev/null || true', { stdio: 'ignore' });
+      execSync('pkill -9 -f "chromium.*whatsapp-web" 2>/dev/null || true', { stdio: 'ignore' });
+      // Also kill orphaned chrome processes from previous runs
+      execSync('pkill -9 -f ".local-chromium" 2>/dev/null || true', { stdio: 'ignore' });
+    } catch (e) {
+      // Ignore - no Chrome processes to kill
+    }
+
+    // Kill other whatsapp-bot node processes
     try {
       const myPid = process.pid;
-      // macOS compatible: find and kill other whatsapp-bot processes
       const result = execSync(`ps aux | grep "whatsapp-bot" | grep -v grep | awk '{print $2}'`, { encoding: 'utf-8' });
       const pids = result.trim().split('\n').filter(pid => pid && parseInt(pid) !== myPid);
       if (pids.length > 0) {
-        console.log(`  Matando procesos: ${pids.join(', ')}`);
+        console.log(`  Matando procesos node: ${pids.join(', ')}`);
         execSync(`kill -9 ${pids.join(' ')}`, { stdio: 'ignore' });
       }
     } catch (e) {
