@@ -249,6 +249,15 @@ async function submitSolicitud(data) {
   console.log('Step 3: Entering address...');
   console.log('Current URL:', page.url());
 
+  // Ensure we're on the correct page before typing address
+  const currentUrl = page.url();
+  if (!currentUrl.includes('/ubicacion')) {
+    console.log('Wrong page detected, navigating to /ubicacion...');
+    await page.goto('https://bacolaborativa.buenosaires.gob.ar/ubicacion', { waitUntil: 'networkidle0', timeout: 30000 });
+    console.log('Navigated to:', page.url());
+    await delay(2000);
+  }
+
   // Wait for Angular app to load and the autocomplete component to be ready
   console.log('Waiting for address input to appear...');
   try {
@@ -328,8 +337,28 @@ async function submitSolicitud(data) {
   }
 
   if (!suggestionsFound) {
-    console.log('No suggestions appeared, waiting a bit longer...');
-    await delay(3000);
+    console.log('No suggestions appeared, retrying with backspace...');
+
+    // Retry up to 3 times: backspace and retype last character to re-trigger autocomplete
+    for (let retry = 0; retry < 3 && !suggestionsFound; retry++) {
+      console.log(`Retry ${retry + 1}: Backspace and retype last character`);
+      await page.keyboard.press('Backspace');
+      await delay(300);
+      await page.keyboard.type(address.slice(-1), { delay: 100 });
+      await delay(2000);
+
+      // Check if suggestions appeared
+      for (const selector of suggestionSelectors) {
+        try {
+          await page.waitForSelector(selector, { timeout: 3000, visible: true });
+          console.log(`Suggestions found on retry ${retry + 1} with selector: ${selector}`);
+          suggestionsFound = true;
+          break;
+        } catch (e) {
+          // Try next selector
+        }
+      }
+    }
   }
 
   // Debug: Check what's in the suggestions container
@@ -783,28 +812,48 @@ app.post('/login', async (req, res) => {
 
 // Submit solicitud endpoint
 app.post('/solicitud', async (req, res) => {
-  try {
-    const { address, containerType, description, photos, reportType } = req.body;
+  const { address, containerType, description, photos, reportType } = req.body;
 
-    if (!address) {
-      return res.status(400).json({ success: false, error: 'Address is required' });
-    }
-
-    console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"`);
-    const result = await submitSolicitud({ address, containerType, description, photos, reportType });
-
-    // Close browser after successful submission
-    await closeBrowser();
-
-    res.json(result);
-  } catch (error) {
-    console.error('Error submitting solicitud:', error);
-
-    // Close browser on error too
-    await closeBrowser();
-
-    res.status(500).json({ success: false, error: error.message });
+  if (!address) {
+    return res.status(400).json({ success: false, error: 'Address is required' });
   }
+
+  console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"`);
+
+  // Retry logic: if first attempt fails, close browser and try once more with fresh session
+  const maxAttempts = 2;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (attempt > 1) {
+        console.log(`\n=== RETRY ATTEMPT ${attempt}/${maxAttempts} with fresh browser session ===\n`);
+      }
+
+      const result = await submitSolicitud({ address, containerType, description, photos, reportType });
+
+      // Close browser after successful submission
+      await closeBrowser();
+
+      return res.json(result);
+    } catch (error) {
+      console.error(`Error on attempt ${attempt}:`, error.message);
+      lastError = error;
+
+      // Close browser before retry or final failure
+      await closeBrowser();
+
+      // Only retry for specific errors that might be fixed by a fresh session
+      if (attempt < maxAttempts && error.message.includes('No address suggestions found')) {
+        console.log('Retrying with fresh browser session...');
+        await new Promise(r => setTimeout(r, 2000)); // Brief delay before retry
+      } else {
+        break;
+      }
+    }
+  }
+
+  res.status(500).json({ success: false, error: lastError.message });
 });
 
 // Cleanup endpoint

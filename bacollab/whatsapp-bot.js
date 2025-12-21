@@ -140,6 +140,9 @@ class TrashReportBot {
 
   async handleMessage(msg) {
     try {
+      // Skip bot's own messages
+      if (msg.fromMe) return;
+
       const chat = await msg.getChat();
 
       // Only respond to messages in the target group
@@ -469,7 +472,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-3-5-haiku-20241022',
+            model: 'claude-haiku-4-5-20251001',
             max_tokens: 500,
             system: getSystemPrompt(),
             messages: [{ role: 'user', content }]
@@ -709,6 +712,9 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
       const messagesBySender = new Map();
 
       for (const msg of messages) {
+        // Skip bot's own messages
+        if (msg.fromMe) continue;
+
         // Skip old messages (older than 2 hours)
         const msgAge = Date.now() - msg.timestamp * 1000;
         if (msgAge > MESSAGE_RETENTION_MS) continue;

@@ -73,12 +73,14 @@ FORMATO JSON:
 
 NOTA: msgIndex indica qué mensaje tiene la foto correcta para ese reporte
 
-ALIAS DE CALLES - Usá el nombre completo:
+ALIAS DE CALLES - SOLO transformá estos nombres EXACTOS:
 - "Uriburu" → "Pres. José Evaristo Uriburu"
 - "Peron" / "Perón" → "Tte. Gral. Juan Domingo Perón"
 - "Mitre" → "Bartolomé Mitre"
 - "Corrientes" → "Av. Corrientes"
 - "Callao" → "Av. Callao"
+
+IMPORTANTE: NO transformes otros nombres de calles. Si alguien dice "Pasteur 125", dejalo EXACTAMENTE como "Pasteur 125". Solo aplicá los alias de arriba.
 
 REGLAS:
 - shouldRespond: false para TODO lo que no sea un reporte claro o casi-claro
