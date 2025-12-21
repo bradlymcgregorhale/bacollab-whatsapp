@@ -176,13 +176,23 @@ class TrashReportBot {
         timestamp: new Date()
       };
 
-      // Handle photo
+      // Handle photo or video
       if (msg.hasMedia) {
         const media = await msg.downloadMedia();
         if (media && media.mimetype.startsWith('image/')) {
           const photoPath = await this.savePhoto(media, senderId);
           messageObj.photo = photoPath;
           console.log(`  Foto guardada: ${photoPath}`);
+        } else if (media && media.mimetype.startsWith('video/')) {
+          // Extract first frame from video using ffmpeg
+          console.log(`  Video detectado, extrayendo frame...`);
+          const photoPath = await this.extractVideoFrame(media, senderId);
+          if (photoPath) {
+            messageObj.photo = photoPath;
+            console.log(`  Frame extraído: ${photoPath}`);
+          } else {
+            console.log(`  No se pudo extraer frame del video`);
+          }
         }
       }
 
@@ -272,35 +282,85 @@ class TrashReportBot {
       // Use Claude to extract requests
       const extraction = await this.extractRequests(pending);
 
-      // If we need to respond (problem to communicate)
-      if (extraction.shouldRespond && extraction.response) {
+      // Handle address corrections
+      if (extraction.isCorrection && extraction.correctedAddress) {
         const senderInfo = this.senderIdCache?.get(senderId);
         const mentions = senderInfo ? [senderInfo.senderId] : [];
         const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
-        await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions });
-        console.log(`  [Bot] @${pending.senderName} ${extraction.response}`);
-        // Reset messages but keep for follow-up
+
+        // Find pending request from this sender in the queue
+        const pendingRequestIdx = requestQueue.findIndex(r => r.senderId === senderId);
+
+        if (pendingRequestIdx !== -1 && !isProcessingQueue) {
+          // Can cancel - request is still in queue
+          const oldAddress = requestQueue[pendingRequestIdx].address;
+          requestQueue[pendingRequestIdx].address = extraction.correctedAddress;
+          console.log(`  [Bot] Corrección: "${oldAddress}" → "${extraction.correctedAddress}"`);
+          await chat.sendMessage(`${mentionText} Dale, cambio la dirección a ${extraction.correctedAddress}.`.trim(), { mentions });
+        } else if (pendingRequestIdx !== -1) {
+          // Request is being processed, too late
+          console.log(`  [Bot] Corrección tarde - solicitud ya procesándose`);
+          await chat.sendMessage(`${mentionText} Uy, ya mandé la solicitud anterior. Voy a mandar otra para ${extraction.correctedAddress}.`.trim(), { mentions });
+
+          // Queue the corrected address as a new request
+          const existingReq = requestQueue[pendingRequestIdx];
+          requestQueue.push({
+            ...existingReq,
+            address: extraction.correctedAddress
+          });
+        } else {
+          // No pending request found - treat as new request
+          console.log(`  [Bot] Corrección pero no hay solicitud pendiente`);
+        }
+
         pending.messages = [];
         pending.timer = null;
+        pendingMessages.delete(senderId);
         return;
       }
 
       // If nothing actionable and no response needed, stay quiet
       if (!extraction.requests || extraction.requests.length === 0) {
+        // Only respond if Claude says we should (e.g., asking for address)
+        if (extraction.shouldRespond && extraction.response) {
+          const senderInfo = this.senderIdCache?.get(senderId);
+          const mentions = senderInfo ? [senderInfo.senderId] : [];
+          const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+          await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions });
+          console.log(`  [Bot] @${pending.senderName} ${extraction.response}`);
+          // Reset messages but keep for follow-up
+          pending.messages = [];
+          pending.timer = null;
+          return;
+        }
         console.log('  [Bot] Nada actionable, ignorando');
         pendingMessages.delete(senderId);
         return;
       }
 
-      // We have valid requests - queue them directly (no confirmation needed)
+      // We have valid requests - queue them directly (ignore shouldRespond if we have requests)
       if (extraction.requests && extraction.requests.length > 0) {
-        // Acknowledge the request
+        // Acknowledge the request with report type description
         const senderInfo = this.senderIdCache?.get(senderId);
         const mentions = senderInfo ? [senderInfo.senderId] : [];
         const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
-        const addresses = extraction.requests.map(r => r.address).join(', ');
-        await chat.sendMessage(`${mentionText} Ya mando la solicitud para ${addresses}...`.trim(), { mentions });
-        console.log(`  [Bot] Procesando: ${addresses}`);
+
+        // Build descriptive message for each request type
+        const requestDescriptions = extraction.requests.map(r => {
+          const addr = r.address;
+          if (r.reportType === 'barrido') {
+            return `mejora de barrido en ${addr}`;
+          } else {
+            return `recolección de residuos en ${addr}`;
+          }
+        });
+
+        const descriptionText = requestDescriptions.length === 1
+          ? requestDescriptions[0]
+          : requestDescriptions.join(' y ');
+
+        await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${descriptionText}...`.trim(), { mentions });
+        console.log(`  [Bot] Procesando: ${descriptionText}`);
 
         for (const req of extraction.requests) {
           let photo = null;
@@ -556,6 +616,42 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     return filepath;
   }
 
+  async extractVideoFrame(media, senderId) {
+    const { execSync } = await import('child_process');
+    const timestamp = Date.now();
+    const videoExt = media.mimetype.split('/')[1] || 'mp4';
+    const videoFilename = `${senderId.replace(/[^a-zA-Z0-9]/g, '_')}_${timestamp}.${videoExt}`;
+    const videoPath = path.join(PHOTOS_DIR, videoFilename);
+    const frameFilename = `${senderId.replace(/[^a-zA-Z0-9]/g, '_')}_${timestamp}_frame.jpg`;
+    const framePath = path.join(PHOTOS_DIR, frameFilename);
+
+    try {
+      // Save video temporarily
+      const buffer = Buffer.from(media.data, 'base64');
+      fs.writeFileSync(videoPath, buffer);
+
+      // Extract first frame using ffmpeg (at 0.5 seconds to avoid black frames)
+      execSync(`ffmpeg -y -i "${videoPath}" -ss 00:00:00.5 -vframes 1 -q:v 2 "${framePath}" 2>/dev/null`, {
+        timeout: 30000
+      });
+
+      // Clean up video file
+      try { fs.unlinkSync(videoPath); } catch (e) {}
+
+      // Check if frame was extracted
+      if (fs.existsSync(framePath)) {
+        return framePath;
+      }
+      return null;
+    } catch (e) {
+      console.error('Error extracting video frame:', e.message);
+      // Clean up files
+      try { fs.unlinkSync(videoPath); } catch (e) {}
+      try { fs.unlinkSync(framePath); } catch (e) {}
+      return null;
+    }
+  }
+
   async getSenderName(msg) {
     try {
       const contact = await msg.getContact();
@@ -665,6 +761,11 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
 
         if (extraction.requests && extraction.requests.length > 0) {
           for (const req of extraction.requests) {
+            // Skip if no address
+            if (!req.address) {
+              console.log(`[Startup] Request sin dirección, ignorando`);
+              continue;
+            }
             // Skip if already processed
             if (processedAddresses.has(req.address.toLowerCase())) {
               console.log(`[Startup] Ya procesado: ${req.address}`);

@@ -37,6 +37,8 @@ DETECTAR INTENCIÓN Y ACCIÓN:
 
 CRÍTICO: Cuando hay foto de calle sucia/basura + dirección = CREAR REQUEST con reportType "barrido" o "recoleccion" según corresponda. El sistema automáticamente le avisa al usuario que se está procesando y después le manda el link de confirmación. Vos solo tenés que devolver el request en el JSON.
 
+IMPORTANTE: Si tenés requests válidos, SIEMPRE poné shouldRespond: false y response: "". El sistema genera su propio mensaje de confirmación. NO inventes respuestas cuando hay requests.
+
 NOTA SOBRE MENSAJES MÚLTIPLES:
 A veces el usuario envía la foto primero y la dirección después (o al revés).
 Analizá TODOS los mensajes juntos.
@@ -46,12 +48,27 @@ EXTRAER:
 2. TIPO DE REPORTE: "recoleccion" o "barrido" - basado en el análisis de la foto
 3. TIPO DE CONTENEDOR (solo para recoleccion): "verde" (reciclables) o "negro" (húmedos) - default "negro"
 
+DIRECCIONES CON INTERSECCIONES (ESQUINAS):
+- Si escriben "esq", "esquina", "y" → convertir a formato "Calle1 y Calle2"
+- Ejemplos:
+  - "Av Jujuy esq Av San Juan" → "Avenida Jujuy y Avenida San Juan"
+  - "Corrientes esquina Callao" → "Av. Corrientes y Av. Callao"
+  - "Rivadavia y Medrano" → "Av. Rivadavia y Medrano"
+- Ignorá referencias adicionales como "puerta de Farmacity", "frente al kiosco", etc.
+
+CORRECCIONES DE DIRECCIÓN:
+- Si el usuario envía una corrección (palabras como "perdón", "perdon", "quise decir", "corrijo", "era", "no, es"), detectalo
+- Agregá al JSON: "isCorrection": true, "correctedAddress": "la nueva dirección"
+- Ejemplo: "Perdon av rivadavia 3218 !!!!" después de haber dicho "4218" → isCorrection: true
+
 FORMATO JSON:
 {
   "shouldRespond": true/false,
   "requests": [{"address": "dirección completa", "reportType": "recoleccion", "containerType": "negro", "msgIndex": 1}],
   "response": "solo si shouldRespond es true Y hay un problema (falta dirección, etc.)",
-  "photoValid": true/false
+  "photoValid": true/false,
+  "isCorrection": false,
+  "correctedAddress": null
 }
 
 NOTA: msgIndex indica qué mensaje tiene la foto correcta para ese reporte
