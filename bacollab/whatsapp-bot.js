@@ -95,7 +95,56 @@ class TrashReportBot {
     });
 
     this.chatCache = new Map();
+    this.scheduledRetries = new Map(); // Map of timeoutId -> request
     this.setupEventHandlers();
+  }
+
+  // Schedule a retry with exponential backoff
+  // Retry 1: 5 minutes, Retry 2: 50 minutes, Retry 3: 500 minutes
+  scheduleRetry(request) {
+    const retryCount = request.retryCount || 0;
+    const retryDelays = [5, 50, 500]; // minutes
+
+    if (retryCount >= 3) {
+      // Max retries reached - notify user of final failure
+      console.log(`[Retry] Max retries (3) reached for ${request.address}`);
+      this.notifyFinalFailure(request);
+      return;
+    }
+
+    const delayMinutes = retryDelays[retryCount];
+    const delayMs = delayMinutes * 60 * 1000;
+
+    console.log(`[Retry] Scheduling retry ${retryCount + 1}/3 for ${request.address} in ${delayMinutes} minutes`);
+
+    const timeoutId = setTimeout(async () => {
+      this.scheduledRetries.delete(timeoutId);
+      console.log(`\n[Retry] Executing retry ${retryCount + 1}/3 for ${request.address}`);
+      await this.submitRequest({ ...request, retryCount: retryCount + 1 }, true);
+    }, delayMs);
+
+    this.scheduledRetries.set(timeoutId, request);
+  }
+
+  async notifyFinalFailure(request) {
+    const { address, chat, senderId } = request;
+    const senderInfo = this.senderIdCache?.get(senderId);
+    const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
+    const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : `@${senderId.split('@')[0]}`;
+
+    try {
+      await chat.sendMessage(
+        `${mentionText} No pude mandar la solicitud para ${address} después de 3 intentos. Por favor, intentá de nuevo más tarde o hacelo manualmente en https://bacolaborativa.buenosaires.gob.ar`,
+        { mentions }
+      );
+    } catch (e) {
+      console.error('[Retry] Error notifying final failure:', e.message);
+    }
+
+    // Clean up photo
+    if (request.photo) {
+      try { fs.unlinkSync(request.photo); } catch (e) {}
+    }
   }
 
   setupEventHandlers() {
@@ -538,7 +587,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     isProcessingQueue = false;
   }
 
-  async submitRequest(request) {
+  async submitRequest(request, isRetry = false) {
     const { senderId, senderName, address, reportType = 'recoleccion', containerType, photo, chat } = request;
     const senderInfo = this.senderIdCache?.get(senderId);
     const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
@@ -546,7 +595,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     const reportTypeName = reportType === 'barrido' ? 'Mejora de barrido' : 'Recolección de residuos';
 
     console.log('\n========================================');
-    console.log('  ENVIANDO SOLICITUD');
+    console.log(`  ${isRetry ? 'REINTENTANDO' : 'ENVIANDO'} SOLICITUD`);
     console.log(`  Vecino: ${senderName}`);
     console.log(`  Dirección: ${address}`);
     console.log(`  Tipo de reporte: ${reportTypeName}`);
@@ -585,25 +634,76 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}. #${result.solicitudNumber}\n${solicitudUrl}`;
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada: #${result.solicitudNumber}`);
+
+        // Clean up photo after successful submission
+        if (photo) {
+          try { fs.unlinkSync(photo); } catch (e) {}
+        }
       } else if (result.success) {
         const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}.`;
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada (sin número)`);
-      } else {
-        await chat.sendMessage(`${mentionText} No pude mandar la solicitud para ${address}. Intentá de nuevo.`, { mentions });
-        console.log(`  [Bot] Error: ${result.error}`);
-      }
 
-      // Clean up photo after submission
-      if (photo) {
-        try {
-          fs.unlinkSync(photo);
-        } catch (e) {}
+        // Clean up photo after successful submission
+        if (photo) {
+          try { fs.unlinkSync(photo); } catch (e) {}
+        }
+      } else {
+        // Check if it's an access/login error
+        const isAccessError = result.error && (
+          result.error.includes('password') ||
+          result.error.includes('login') ||
+          result.error.includes('selector') ||
+          result.error.includes('timeout') ||
+          result.error.includes('exceeded')
+        );
+
+        if (isAccessError) {
+          const retryCount = request.retryCount || 0;
+          const retryDelays = [5, 50, 500];
+          const nextRetryMinutes = retryDelays[retryCount];
+
+          if (retryCount < 3) {
+            // Schedule retry and notify user
+            this.scheduleRetry(request);
+            console.log(`  [Bot] Error de acceso, reintento ${retryCount + 1}/3 programado en ${nextRetryMinutes} min`);
+            await chat.sendMessage(
+              `${mentionText} Hay problemas para acceder a Gestión Colaborativa. Voy a reintentar ${address} en ${nextRetryMinutes} minutos (intento ${retryCount + 1}/3).`,
+              { mentions }
+            );
+          } else {
+            // Max retries - handled by scheduleRetry -> notifyFinalFailure
+            this.scheduleRetry(request);
+          }
+        } else {
+          await chat.sendMessage(`${mentionText} No pude mandar la solicitud para ${address}. Intentá de nuevo.`, { mentions });
+          console.log(`  [Bot] Error: ${result.error}`);
+          // Clean up photo on non-retryable error
+          if (photo) {
+            try { fs.unlinkSync(photo); } catch (e) {}
+          }
+        }
       }
 
     } catch (error) {
       console.error('Error submitting solicitud:', error);
-      await chat.sendMessage(`No pude mandar la solicitud para ${address}. Intentá de nuevo.`);
+
+      // Network or other errors - schedule retry
+      const retryCount = request.retryCount || 0;
+      const retryDelays = [5, 50, 500];
+      const nextRetryMinutes = retryDelays[retryCount];
+
+      if (retryCount < 3) {
+        this.scheduleRetry(request);
+        console.log(`  [Bot] Error de conexión, reintento ${retryCount + 1}/3 programado en ${nextRetryMinutes} min`);
+        await chat.sendMessage(
+          `${mentionText} Hay problemas para acceder a Gestión Colaborativa. Voy a reintentar ${address} en ${nextRetryMinutes} minutos (intento ${retryCount + 1}/3).`,
+          { mentions }
+        );
+      } else {
+        // Max retries reached
+        this.scheduleRetry(request);
+      }
     }
   }
 
@@ -876,6 +976,8 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
       await Promise.race([initPromise, timeoutPromise]);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`[4/4] Inicialización completa (${elapsed}s total)`);
+
+      console.log('[Retry] Sistema de reintentos activado (5min, 50min, 500min)');
     } catch (err) {
       console.error('[DEBUG] Error durante inicialización:', err);
       process.exit(1);
