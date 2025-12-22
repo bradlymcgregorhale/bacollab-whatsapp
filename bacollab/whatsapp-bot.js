@@ -446,13 +446,18 @@ class TrashReportBot {
         // Process new (non-duplicate) requests
         if (newRequests.length > 0) {
           // Build descriptive message for each request type
+          const reportLabels = {
+            recoleccion: 'recolección de residuos',
+            barrido: 'mejora de barrido',
+            obstruccion: 'obstrucción de vereda',
+            ocupacion_comercial: 'ocupación por local comercial',
+            ocupacion_gastronomica: 'ocupación gastronómica',
+            manteros: 'vendedores ambulantes'
+          };
           const requestDescriptions = newRequests.map(r => {
             const addr = r.address;
-            if (r.reportType === 'barrido') {
-              return `mejora de barrido en ${addr}`;
-            } else {
-              return `recolección de residuos en ${addr}`;
-            }
+            const label = reportLabels[r.reportType] || 'recolección de residuos';
+            return `${label} en ${addr}`;
           });
 
           const descriptionText = requestDescriptions.length === 1
@@ -646,7 +651,16 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     const senderInfo = this.senderIdCache?.get(senderId);
     const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
     const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : `@${senderId.split('@')[0]}`;
-    const reportTypeName = reportType === 'barrido' ? 'Mejora de barrido' : 'Recolección de residuos';
+
+    const REPORT_TYPE_LABELS = {
+      recoleccion: 'Recolección de residuos',
+      barrido: 'Mejora de barrido',
+      obstruccion: 'Obstrucción de calle/vereda',
+      ocupacion_comercial: 'Ocupación por local comercial',
+      ocupacion_gastronomica: 'Ocupación por área gastronómica',
+      manteros: 'Manteros/vendedores ambulantes'
+    };
+    const reportTypeName = REPORT_TYPE_LABELS[reportType] || 'Recolección de residuos';
 
     console.log('\n========================================');
     console.log(`  ${isRetry ? 'REINTENTANDO' : 'ENVIANDO'} SOLICITUD`);

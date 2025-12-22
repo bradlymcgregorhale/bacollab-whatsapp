@@ -45,15 +45,23 @@ let isLoggedIn = false;
 
 const URLS = {
   prestaciones: 'https://bacolaborativa.buenosaires.gob.ar/prestaciones',
-  recoleccionResiduos: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1462821007742',
-  mejoraBarrido: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/096059',
+  recoleccion: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1462821007742',
+  barrido: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/096059',
+  obstruccion: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/118020',
+  ocupacion_comercial: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/118001',
+  ocupacion_gastronomica: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1604407880652',
+  manteros: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1334597891562',
   ubicacion: 'https://bacolaborativa.buenosaires.gob.ar/ubicacion'
 };
 
-// Report types
-const REPORT_TYPES = {
-  recoleccion: 'recoleccionResiduos',  // Trash around containers
-  barrido: 'mejoraBarrido'              // Dirt/trash on street/curbs
+// Report type labels for logging
+const REPORT_TYPE_LABELS = {
+  recoleccion: 'Recolección de residuos',
+  barrido: 'Mejora de barrido',
+  obstruccion: 'Obstrucción de calle/vereda',
+  ocupacion_comercial: 'Ocupación por local comercial',
+  ocupacion_gastronomica: 'Ocupación por área gastronómica',
+  manteros: 'Manteros/vendedores ambulantes'
 };
 
 const SELECTORS = {
@@ -225,9 +233,8 @@ async function submitSolicitud(data) {
   const { page } = await initBrowser();
 
   // Determine which URL to use based on report type
-  const urlKey = REPORT_TYPES[reportType] || 'recoleccionResiduos';
-  const targetUrl = URLS[urlKey];
-  const reportTypeName = reportType === 'barrido' ? 'Mejora de barrido' : 'Recolección de residuos';
+  const targetUrl = URLS[reportType] || URLS.recoleccion;
+  const reportTypeName = REPORT_TYPE_LABELS[reportType] || 'Recolección de residuos';
 
   console.log(`Submitting solicitud for address: ${address}`);
   console.log(`Report type: ${reportTypeName}`);
@@ -555,7 +562,7 @@ async function submitSolicitud(data) {
     await clickAccordionSiguiente(page, '#collapseCuestionario');
     await delay(2000);
   } else {
-    console.log('Step 6-7: Skipping questionnaire (not required for barrido)');
+    console.log('Step 6-7: Skipping questionnaire (not required for this report type)');
   }
 
   // Step 8: Description section - click Siguiente inside that accordion
