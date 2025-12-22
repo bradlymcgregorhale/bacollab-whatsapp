@@ -1,8 +1,35 @@
 import puppeteer from 'puppeteer';
 import express from 'express';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
+
+// Setup file logging
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const LOG_FILE = path.join(__dirname, 'index.log');
+
+// Override console.log and console.error to also write to file
+const originalLog = console.log;
+const originalError = console.error;
+
+function formatLog(...args) {
+  const timestamp = new Date().toISOString();
+  return `[${timestamp}] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ')}\n`;
+}
+
+console.log = (...args) => {
+  originalLog(...args);
+  fs.appendFileSync(LOG_FILE, formatLog(...args));
+};
+
+console.error = (...args) => {
+  originalError(...args);
+  fs.appendFileSync(LOG_FILE, formatLog('ERROR:', ...args));
+};
 
 const app = express();
 app.use(express.json());

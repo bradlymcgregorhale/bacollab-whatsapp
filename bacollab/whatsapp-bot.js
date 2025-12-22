@@ -12,6 +12,27 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Setup file logging
+const LOG_FILE = path.join(__dirname, 'whatsapp-bot.log');
+
+const originalLog = console.log;
+const originalError = console.error;
+
+function formatLog(...args) {
+  const timestamp = new Date().toISOString();
+  return `[${timestamp}] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ')}\n`;
+}
+
+console.log = (...args) => {
+  originalLog(...args);
+  fs.appendFileSync(LOG_FILE, formatLog(...args));
+};
+
+console.error = (...args) => {
+  originalError(...args);
+  fs.appendFileSync(LOG_FILE, formatLog('ERROR:', ...args));
+};
+
 // Configuration
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const GROUP_NAME = process.env.WHATSAPP_GROUP_NAME || 'Trash';
@@ -28,7 +49,7 @@ const REPORTS_LOG = path.join(__dirname, 'reports.csv');
 
 // Initialize reports log with header if it doesn't exist
 if (!fs.existsSync(REPORTS_LOG)) {
-  fs.writeFileSync(REPORTS_LOG, 'numero,fecha,direccion,link\n');
+  fs.writeFileSync(REPORTS_LOG, 'numero,fecha,direccion,link,timestamp\n');
 }
 
 // Errors log file
@@ -392,56 +413,89 @@ class TrashReportBot {
 
       // We have valid requests - queue them directly (ignore shouldRespond if we have requests)
       if (extraction.requests && extraction.requests.length > 0) {
-        // Acknowledge the request with report type description
         const senderInfo = this.senderIdCache?.get(senderId);
         const mentions = senderInfo ? [senderInfo.senderId] : [];
         const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
 
-        // Build descriptive message for each request type
-        const requestDescriptions = extraction.requests.map(r => {
-          const addr = r.address;
-          if (r.reportType === 'barrido') {
-            return `mejora de barrido en ${addr}`;
-          } else {
-            return `recolección de residuos en ${addr}`;
-          }
-        });
-
-        const descriptionText = requestDescriptions.length === 1
-          ? requestDescriptions[0]
-          : requestDescriptions.join(' y ');
-
-        await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${descriptionText}...`.trim(), { mentions });
-        console.log(`  [Bot] Procesando: ${descriptionText}`);
+        // Check for duplicates in last 24 hours
+        const processedAddresses = this.getProcessedSolicitudes();
+        const newRequests = [];
+        const duplicates = [];
 
         for (const req of extraction.requests) {
-          let photo = null;
-          // Use msgIndex if provided (1-indexed)
-          if (req.msgIndex && pending.messages[req.msgIndex - 1]?.photo) {
-            photo = pending.messages[req.msgIndex - 1].photo;
+          const recentDupe = this.isRecentDuplicate(req.address, processedAddresses);
+          if (recentDupe) {
+            duplicates.push({ address: req.address, solicitudNumber: recentDupe.solicitudNumber });
           } else {
-            // Fallback: find by address match or use most recent photo
-            const matchingMsg = [...pending.messages].reverse().find(m =>
-              m.photo && m.text && m.text.toLowerCase().includes(req.address.toLowerCase().split(' ')[0])
-            );
-            photo = matchingMsg?.photo || [...pending.messages].reverse().find(m => m.photo)?.photo || null;
+            newRequests.push(req);
           }
-
-          requestQueue.push({
-            senderId,
-            senderName: pending.senderName,
-            address: req.address,
-            reportType: req.reportType || 'recoleccion',
-            containerType: req.containerType || 'negro',
-            photo,
-            chat
-          });
         }
 
-        console.log(`  Queued ${extraction.requests.length} request(s)`);
-        for (const req of extraction.requests) {
+        // Notify about duplicates
+        if (duplicates.length > 0) {
+          for (const dupe of duplicates) {
+            const dupeUrl = `https://bacolaborativa.buenosaires.gob.ar/detalleSolicitud/${dupe.solicitudNumber.replace(/\//g, '&')}?vieneDeMisSolicitudes=false`;
+            await chat.sendMessage(
+              `${mentionText} Ya mandé una solicitud para ${dupe.address} en las últimas 24 horas (#${dupe.solicitudNumber}).\n${dupeUrl}`.trim(),
+              { mentions }
+            );
+            console.log(`  [Bot] Duplicado detectado: ${dupe.address} (#${dupe.solicitudNumber})`);
+          }
+        }
+
+        // Process new (non-duplicate) requests
+        if (newRequests.length > 0) {
+          // Build descriptive message for each request type
+          const requestDescriptions = newRequests.map(r => {
+            const addr = r.address;
+            if (r.reportType === 'barrido') {
+              return `mejora de barrido en ${addr}`;
+            } else {
+              return `recolección de residuos en ${addr}`;
+            }
+          });
+
+          const descriptionText = requestDescriptions.length === 1
+            ? requestDescriptions[0]
+            : requestDescriptions.join(' y ');
+
+          await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${descriptionText}...`.trim(), { mentions });
+          console.log(`  [Bot] Procesando: ${descriptionText}`);
+
+          for (const req of newRequests) {
+            let photo = null;
+            // Use msgIndex if provided (1-indexed)
+            if (req.msgIndex && pending.messages[req.msgIndex - 1]?.photo) {
+              photo = pending.messages[req.msgIndex - 1].photo;
+            } else {
+              // Fallback: find by address match or use most recent photo
+              const matchingMsg = [...pending.messages].reverse().find(m =>
+                m.photo && m.text && m.text.toLowerCase().includes(req.address.toLowerCase().split(' ')[0])
+              );
+              photo = matchingMsg?.photo || [...pending.messages].reverse().find(m => m.photo)?.photo || null;
+            }
+
+            requestQueue.push({
+              senderId,
+              senderName: pending.senderName,
+              address: req.address,
+              reportType: req.reportType || 'recoleccion',
+              containerType: req.containerType || 'negro',
+              photo,
+              chat
+            });
+          }
+
+          console.log(`  Queued ${newRequests.length} request(s)`);
+        }
+
+        // Log request details
+        for (const req of newRequests) {
           const reportTypeLabel = req.reportType === 'barrido' ? 'barrido' : 'recoleccion';
-          console.log(`    - ${req.address} (tipo: ${reportTypeLabel}, msgIndex: ${req.msgIndex || 'auto'}, foto: ${req.photo ? 'sí' : 'no'})`);
+          console.log(`    - ${req.address} (tipo: ${reportTypeLabel}, msgIndex: ${req.msgIndex || 'auto'})`);
+        }
+        for (const dupe of duplicates) {
+          console.log(`    - ${dupe.address} (DUPLICADO - #${dupe.solicitudNumber})`);
         }
 
         // Clear pending messages for this user
@@ -627,7 +681,8 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         // Log to CSV file
         const today = new Date();
         const dateStr = `${today.getDate().toString().padStart(2, '0')}/${(today.getMonth() + 1).toString().padStart(2, '0')}/${today.getFullYear()}`;
-        const csvLine = `${result.solicitudNumber},${dateStr},"${address}",${solicitudUrl}\n`;
+        const timestamp = Date.now();
+        const csvLine = `${result.solicitudNumber},${dateStr},"${address}",${solicitudUrl},${timestamp}\n`;
         fs.appendFileSync(REPORTS_LOG, csvLine);
         console.log(`  [Log] Guardado en reports.csv`);
 
@@ -768,23 +823,44 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // Load already processed solicitud numbers from CSV
+  // Load already processed solicitudes from CSV with timestamps
   getProcessedSolicitudes() {
-    const processed = new Set();
+    const processed = new Map(); // address -> { timestamp, solicitudNumber }
     if (fs.existsSync(REPORTS_LOG)) {
       const content = fs.readFileSync(REPORTS_LOG, 'utf-8');
       const lines = content.split('\n').slice(1); // Skip header
       for (const line of lines) {
         if (line.trim()) {
-          // Extract address from CSV line
-          const match = line.match(/"([^"]+)"/);
-          if (match) {
-            processed.add(match[1].toLowerCase());
+          // Extract address and timestamp from CSV line
+          // Format: numero,fecha,"direccion",link,timestamp
+          const addressMatch = line.match(/"([^"]+)"/);
+          const parts = line.split(',');
+          const timestamp = parseInt(parts[parts.length - 1]) || 0;
+          const solicitudNumber = parts[0];
+
+          if (addressMatch) {
+            const address = addressMatch[1].toLowerCase();
+            // Keep the most recent entry for each address
+            if (!processed.has(address) || processed.get(address).timestamp < timestamp) {
+              processed.set(address, { timestamp, solicitudNumber });
+            }
           }
         }
       }
     }
     return processed;
+  }
+
+  // Check if address was submitted in last 24 hours
+  isRecentDuplicate(address, processedMap) {
+    const entry = processedMap.get(address.toLowerCase());
+    if (!entry) return null;
+
+    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+    if (entry.timestamp > twentyFourHoursAgo) {
+      return entry; // Return the entry so we can show the solicitud number
+    }
+    return null;
   }
 
   async checkPastMessages() {
@@ -872,9 +948,10 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
               console.log(`[Startup] Request sin dirección, ignorando`);
               continue;
             }
-            // Skip if already processed
-            if (processedAddresses.has(req.address.toLowerCase())) {
-              console.log(`[Startup] Ya procesado: ${req.address}`);
+            // Skip if already processed in last 24 hours
+            const recentDupe = this.isRecentDuplicate(req.address, processedAddresses);
+            if (recentDupe) {
+              console.log(`[Startup] Ya procesado en últimas 24h: ${req.address} (#${recentDupe.solicitudNumber})`);
               continue;
             }
 
