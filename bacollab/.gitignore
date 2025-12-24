@@ -25,3 +25,6 @@ npm-debug.log*
 # Generated data
 reports.csv
 photos/
+
+# Debug screenshots
+*.png
