@@ -4,8 +4,15 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
+import Anthropic from '@anthropic-ai/sdk';
 
 dotenv.config();
+
+// Initialize Anthropic client for intelligent form filling
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
+});
 
 // Setup file logging
 const __filename = fileURLToPath(import.meta.url);
@@ -86,11 +93,345 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Capture network requests during an action to see what's happening
+async function captureNetworkDuringAction(page, actionFn, timeout = 5000) {
+  const requests = [];
+  const responses = [];
+  const errors = [];
+
+  const requestHandler = request => {
+    const url = request.url();
+    if (url.includes('/api/') || url.includes('solicitud') || url.includes('validar') || url.includes('guardar')) {
+      requests.push({
+        method: request.method(),
+        url: url,
+        postData: request.postData()
+      });
+    }
+  };
+
+  const responseHandler = async response => {
+    const url = response.url();
+    if (url.includes('/api/') || url.includes('solicitud') || url.includes('validar') || url.includes('guardar')) {
+      let body = null;
+      try {
+        body = await response.text();
+      } catch (e) {}
+      responses.push({
+        url: url,
+        status: response.status(),
+        body: body ? body.substring(0, 1000) : null
+      });
+    }
+  };
+
+  const errorHandler = error => {
+    errors.push(error.message);
+  };
+
+  page.on('request', requestHandler);
+  page.on('response', responseHandler);
+  page.on('pageerror', errorHandler);
+
+  try {
+    // Execute the action
+    await actionFn();
+
+    // Wait a bit for network activity
+    await delay(timeout);
+  } finally {
+    page.off('request', requestHandler);
+    page.off('response', responseHandler);
+    page.off('pageerror', errorHandler);
+  }
+
+  return { requests, responses, errors };
+}
+
+// Deep inspection of all accordions to find incomplete sections
+async function inspectAllAccordions(page) {
+  return await page.evaluate(() => {
+    const result = {
+      accordions: [],
+      summary: {
+        allComplete: true,
+        incompleteSection: null,
+        missingFields: []
+      }
+    };
+
+    // Get all accordion items
+    const accordionItems = document.querySelectorAll('.accordion-item, [class*="accordion"]');
+
+    for (const item of accordionItems) {
+      const header = item.querySelector('.accordion-header, .accordion-button, button[data-bs-toggle]');
+      const collapse = item.querySelector('.accordion-collapse, .collapse');
+
+      if (!collapse) continue;
+
+      const accordionId = collapse.id || 'unknown';
+      const headerText = header ? header.textContent.trim().substring(0, 100) : '';
+      const isOpen = collapse.classList.contains('show');
+
+      // Check for completion indicators
+      const hasCheckmark = item.querySelector('.fa-check, .bi-check, [class*="check"], .completed') !== null;
+      const hasWarning = item.querySelector('.fa-warning, .bi-exclamation, [class*="warning"], .incomplete') !== null;
+
+      // If open, inspect contents
+      let contents = null;
+      if (isOpen) {
+        const body = collapse.querySelector('.accordion-body') || collapse;
+
+        // Find all form elements
+        const inputs = body.querySelectorAll('input:not([type="hidden"])');
+        const textareas = body.querySelectorAll('textarea');
+        const selects = body.querySelectorAll('select');
+        const radios = body.querySelectorAll('input[type="radio"]');
+        const radioGroups = {};
+
+        // Check radio groups
+        for (const radio of radios) {
+          const name = radio.name || 'unnamed';
+          if (!radioGroups[name]) {
+            radioGroups[name] = { checked: false, options: [] };
+          }
+          radioGroups[name].options.push(radio.value);
+          if (radio.checked) {
+            radioGroups[name].checked = true;
+          }
+        }
+
+        // Check for empty required fields
+        const emptyFields = [];
+        for (const input of inputs) {
+          if (input.type === 'radio') continue;
+          if ((input.required || input.classList.contains('ng-invalid')) && !input.value) {
+            emptyFields.push(input.name || input.placeholder || input.id || 'unknown input');
+          }
+        }
+        for (const textarea of textareas) {
+          if ((textarea.required || textarea.classList.contains('ng-invalid')) && !textarea.value) {
+            emptyFields.push(textarea.name || textarea.placeholder || 'unknown textarea');
+          }
+        }
+
+        // Check for unselected required radio groups
+        for (const [name, group] of Object.entries(radioGroups)) {
+          if (!group.checked) {
+            emptyFields.push(`radio group: ${name}`);
+          }
+        }
+
+        // Check for Siguiente button state
+        const siguienteBtn = body.querySelector('button');
+        const btnState = siguienteBtn ? {
+          text: siguienteBtn.textContent.trim(),
+          disabled: siguienteBtn.disabled
+        } : null;
+
+        contents = {
+          inputCount: inputs.length,
+          textareaCount: textareas.length,
+          radioGroups: Object.keys(radioGroups).length,
+          emptyFields,
+          buttonState: btnState,
+          innerText: body.innerText.substring(0, 300)
+        };
+
+        if (emptyFields.length > 0) {
+          result.summary.allComplete = false;
+          result.summary.incompleteSection = accordionId;
+          result.summary.missingFields = emptyFields;
+        }
+      }
+
+      result.accordions.push({
+        id: accordionId,
+        header: headerText,
+        isOpen,
+        hasCheckmark,
+        hasWarning,
+        contents
+      });
+    }
+
+    return result;
+  });
+}
+
+// Intelligent form filling - THINK about what's on screen and act
+async function analyzeAndFillForm(page, availableData) {
+  const { reportType, address, schedule, containerType, hasPhoto } = availableData;
+
+  // THINK: What's currently visible on the page?
+  const formContext = await page.evaluate(() => {
+    const questionnaireAccordion = document.querySelector('#collapseCuestionario.show .accordion-body');
+    if (!questionnaireAccordion) return null;
+
+    // What's in this accordion?
+    const textarea = questionnaireAccordion.querySelector('textarea');
+    const radioInputs = questionnaireAccordion.querySelectorAll('input[type="radio"]');
+    const labels = Array.from(questionnaireAccordion.querySelectorAll('label')).map(l => l.textContent.trim());
+    const buttons = questionnaireAccordion.querySelectorAll('button');
+
+    // Is there an enabled Siguiente button?
+    let siguienteBtn = null;
+    let siguienteDisabled = false;
+    for (const btn of buttons) {
+      if (btn.textContent.includes('Siguiente')) {
+        siguienteBtn = true;
+        siguienteDisabled = btn.disabled;
+        break;
+      }
+    }
+
+    // What's the question being asked?
+    const questionLabel = questionnaireAccordion.querySelector('label')?.textContent?.trim() || '';
+
+    return {
+      hasTextarea: !!textarea,
+      textareaValue: textarea?.value || '',
+      textareaEmpty: textarea && (!textarea.value || textarea.value.length < 3),
+      hasRadio: radioInputs.length > 0,
+      radioLabels: labels.filter(l => l === 'Sí' || l === 'No'),
+      radioSelected: !!questionnaireAccordion.querySelector('input[type="radio"]:checked'),
+      questionLabel,
+      hasSiguiente: !!siguienteBtn,
+      siguienteDisabled,
+      fullText: questionnaireAccordion.innerText.substring(0, 500)
+    };
+  });
+
+  if (!formContext) {
+    console.log('[Form AI] No questionnaire accordion visible - done');
+    return { action: 'done' };
+  }
+
+  console.log('[Form AI] THINKING about form state:', JSON.stringify(formContext, null, 2));
+
+  // THINK: What needs to be done based on what we see?
+
+  // Case 1: There's an empty textarea asking for days/hours
+  if (formContext.hasTextarea && formContext.textareaEmpty) {
+    console.log('[Form AI] DECISION: Fill textarea with schedule');
+    return {
+      action: 'fill_textarea',
+      value: schedule || 'No especificado',
+      then: 'click_siguiente'
+    };
+  }
+
+  // Case 2: There are radio buttons (Sí/No) and none selected - likely "¿Querés sumar información?"
+  if (formContext.hasRadio && !formContext.radioSelected) {
+    // THINK: Is this asking if we want to add more info?
+    const isAskingForMore = formContext.questionLabel.toLowerCase().includes('sumar') ||
+                            formContext.questionLabel.toLowerCase().includes('adicional') ||
+                            formContext.questionLabel.toLowerCase().includes('agregar');
+
+    if (isAskingForMore) {
+      console.log('[Form AI] DECISION: Answering "No" to add more info question');
+      return { action: 'click_radio', value: 'No', then: 'click_siguiente' };
+    } else {
+      // Some other yes/no question - default to No
+      console.log('[Form AI] DECISION: Answering "No" to unknown yes/no question');
+      return { action: 'click_radio', value: 'No', then: 'click_siguiente' };
+    }
+  }
+
+  // Case 3: Textarea is filled and no radios, just need to click Siguiente
+  if (formContext.hasTextarea && !formContext.textareaEmpty && formContext.hasSiguiente && !formContext.siguienteDisabled) {
+    console.log('[Form AI] DECISION: Textarea filled, clicking Siguiente');
+    return { action: 'click_siguiente' };
+  }
+
+  // Case 4: Radio is selected, just need to click Siguiente
+  if (formContext.hasRadio && formContext.radioSelected && formContext.hasSiguiente && !formContext.siguienteDisabled) {
+    console.log('[Form AI] DECISION: Radio selected, clicking Siguiente');
+    return { action: 'click_siguiente' };
+  }
+
+  // Case 5: Siguiente button exists but is disabled - something not filled
+  if (formContext.siguienteDisabled) {
+    console.log('[Form AI] WARNING: Siguiente disabled, checking what needs to be filled...');
+    // Try to fill whatever is empty
+    if (formContext.hasTextarea && formContext.textareaEmpty) {
+      return { action: 'fill_textarea', value: schedule || 'No especificado', then: 'wait' };
+    }
+    if (formContext.hasRadio && !formContext.radioSelected) {
+      return { action: 'click_radio', value: 'No', then: 'wait' };
+    }
+  }
+
+  // Default: questionnaire might be done
+  if (!formContext.hasSiguiente) {
+    console.log('[Form AI] No Siguiente button - questionnaire complete');
+    return { action: 'done' };
+  }
+
+  console.log('[Form AI] Continuing to next step...');
+  return { action: 'continue' };
+}
+
+// Execute form action returned by Claude - targets questionnaire accordion specifically
+async function executeFormAction(page, action) {
+  console.log('[Form Execute] Action:', action);
+
+  if (action.action === 'fill_textarea') {
+    await page.evaluate((value) => {
+      const textarea = document.querySelector('#collapseCuestionario.show textarea');
+      if (textarea) {
+        textarea.value = value;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }, action.value);
+    console.log('[Form Execute] Filled textarea with:', action.value);
+  }
+
+  if (action.action === 'click_radio') {
+    await page.evaluate((targetValue) => {
+      const labels = document.querySelectorAll('#collapseCuestionario.show label.form-radio-label');
+      for (const label of labels) {
+        const text = label.textContent.trim().toLowerCase();
+        if (text.includes(targetValue.toLowerCase())) {
+          label.click();
+          return true;
+        }
+      }
+      return false;
+    }, action.value);
+    console.log('[Form Execute] Clicked radio:', action.value);
+  }
+
+  // Wait for Angular to update
+  await delay(1000);
+
+  if (action.then === 'click_siguiente' || action.action === 'click_siguiente') {
+    const clicked = await page.evaluate(() => {
+      const buttons = document.querySelectorAll('#collapseCuestionario.show button');
+      for (const btn of buttons) {
+        if (btn.textContent.includes('Siguiente') && !btn.disabled) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (clicked) {
+      console.log('[Form Execute] Clicked Siguiente');
+    } else {
+      console.log('[Form Execute] No enabled Siguiente button found');
+    }
+    await delay(2000);
+  }
+
+  return action;
+}
+
 async function initBrowser() {
   if (!browser) {
     console.log('Launching browser...');
     browser = await puppeteer.launch({
-      headless: process.platform === 'linux' ? 'new' : false,
+      headless: process.platform === 'linux' ? 'new' : false,  // Headless on Linux, visible on Mac
       slowMo: 30,
       defaultViewport: { width: 1280, height: 800 },
       args: [
@@ -129,6 +470,19 @@ async function initBrowser() {
           }
         } catch (e) {}
       }
+    });
+
+    // Capture browser console messages (errors, warnings, logs)
+    page.on('console', msg => {
+      const type = msg.type();
+      if (type === 'error' || type === 'warning') {
+        console.log(`[Browser ${type.toUpperCase()}]`, msg.text());
+      }
+    });
+
+    // Capture page errors (uncaught exceptions)
+    page.on('pageerror', error => {
+      console.log('[Browser PAGE ERROR]', error.message);
     });
   }
   return { browser, page };
@@ -221,7 +575,7 @@ async function login() {
 }
 
 async function submitSolicitud(data) {
-  const { address, containerType = 'negro', description = '', reportType = 'recoleccion' } = data;
+  const { address, containerType = 'negro', description = '', reportType = 'recoleccion', schedule = null } = data;
 
   if (!isLoggedIn) {
     const loginSuccess = await login();
@@ -523,154 +877,1053 @@ async function submitSolicitud(data) {
 
   await page.screenshot({ path: 'debug-after-nueva-solicitud.png', fullPage: true });
 
-  // Step 6 & 7: Only for 'recoleccion' type - fill questionnaire and click Siguiente
-  if (reportType === 'recoleccion') {
-    console.log('Step 6: Selecting container type...');
+  // Step 6 & 7: Intelligent form filling using Claude AI
+  console.log('Step 6: Intelligent form filling...');
+  await page.screenshot({ path: 'debug-questionnaire.png', fullPage: true });
 
-    await page.screenshot({ path: 'debug-questionnaire.png', fullPage: true });
+  // Prepare available data for Claude
+  const availableData = {
+    reportType,
+    address,
+    schedule: schedule || 'No especificado',
+    containerType: containerType || 'negro',
+    hasPhoto: data.photos && data.photos.length > 0
+  };
 
-    // Click the radio button for container type
-    const radioClicked = await page.evaluate((type) => {
-      // Try clicking the label directly (more reliable)
-      const labels = document.querySelectorAll('label.form-radio-label');
-      for (const label of labels) {
-        const text = label.textContent || '';
-        if (type === 'verde' && text.includes('reciclables')) {
-          label.click();
-          return { success: true, text };
-        }
-        if (type === 'negro' && text.includes('húmedos')) {
-          label.click();
-          return { success: true, text };
-        }
-      }
-      // Fallback to radio button IDs
-      const radioId = type === 'verde' ? 'respuesta45731' : 'respuesta45732';
-      const radio = document.getElementById(radioId);
-      if (radio) {
-        radio.click();
-        return { success: true, method: 'radio id' };
-      }
-      return { success: false };
-    }, containerType);
+  // Keep analyzing and filling questionnaire until done or need_info
+  for (let step = 0; step < 10; step++) {
+    // Check if questionnaire accordion specifically is visible
+    const hasQuestionnaire = await page.evaluate(() => {
+      const accordion = document.querySelector('#collapseCuestionario.show');
+      return !!accordion;
+    });
 
-    console.log('Radio click result:', radioClicked);
-    await delay(1000);
-
-    // Step 7: Click Siguiente inside the questionnaire accordion
-    console.log('Step 7: Clicking Siguiente in questionnaire section...');
-    await clickAccordionSiguiente(page, '#collapseCuestionario');
-    await delay(2000);
-  } else {
-    console.log('Step 6-7: Skipping questionnaire (not required for this report type)');
-  }
-
-  // Step 8: Description section - click Siguiente inside that accordion
-  console.log('Step 8: Clicking Siguiente in description section...');
-  await page.screenshot({ path: 'debug-description.png', fullPage: true });
-  await clickAccordionSiguiente(page, '#collapseDescribirSituacion');
-  await delay(2000);
-
-  // Step 9: Photos section - upload photos if provided, then click Siguiente
-  console.log('Step 9: Handling photos section...');
-  await page.screenshot({ path: 'debug-photos.png', fullPage: true });
-
-  // Upload photos if provided
-  if (data.photos && data.photos.length > 0) {
-    console.log(`Uploading ${data.photos.length} photo(s)...`);
-
-    for (let i = 0; i < Math.min(data.photos.length, 3); i++) {
-      const photoPath = data.photos[i];
-      console.log(`  Uploading photo ${i + 1}: ${photoPath}`);
-
-      try {
-        // Find the file input (there are multiple, get the first available one)
-        const fileInputs = await page.$$('input[type="file"]#file-upload');
-        if (fileInputs.length > i) {
-          await fileInputs[i].uploadFile(photoPath);
-          console.log(`  Photo ${i + 1} uploaded`);
-          await delay(2000); // Wait for upload to process
-        }
-      } catch (uploadError) {
-        console.log(`  Failed to upload photo ${i + 1}:`, uploadError.message);
-      }
+    if (!hasQuestionnaire) {
+      console.log(`[Form AI] Step ${step + 1}: Questionnaire complete, moving on`);
+      break;
     }
 
-    await page.screenshot({ path: 'debug-after-photo-upload.png', fullPage: true });
+    // Use Claude to analyze the form and decide what to do
+    const action = await analyzeAndFillForm(page, availableData);
+
+    if (action.action === 'done') {
+      console.log(`[Form AI] Step ${step + 1}: Form complete`);
+      break;
+    }
+
+    if (action.action === 'need_info') {
+      console.log(`[Form AI] Step ${step + 1}: Need info - ${action.question}`);
+      // Return special response so WhatsApp bot can ask the user
+      return {
+        success: false,
+        needsInfo: true,
+        question: action.question,
+        field: action.field || 'unknown'
+      };
+    }
+
+    if (action.action === 'continue') {
+      console.log(`[Form AI] Step ${step + 1}: Continuing...`);
+      await delay(1000);
+      continue;
+    }
+
+    // Execute the action
+    await executeFormAction(page, action);
+    await page.screenshot({ path: `debug-form-step-${step + 1}.png`, fullPage: true });
   }
 
-  await clickAccordionSiguiente(page, '#collapseFotos');
-  await delay(2000);
+  // Dynamic accordion handling - process each accordion in order
+  console.log('Processing form accordions dynamically...');
+  await page.screenshot({ path: 'debug-accordions.png', fullPage: true });
 
-  // Step 10: Contact section is last - now click the main Siguiente at bottom
-  console.log('Step 10: Clicking main Siguiente button (form-actions)...');
-  await page.screenshot({ path: 'debug-contact.png', fullPage: true });
+  // Step A: Handle Description accordion
+  console.log('Step A: Description accordion...');
+  const descResult = await clickAccordionButton(page, '#collapseDescribirSituacion');
+  console.log(`Description accordion: ${JSON.stringify(descResult)}`);
+  if (descResult.success) {
+    await delay(2000);
+  }
 
-  // Wait for contact section to be visible
-  await page.waitForSelector('#collapseSolicitudContacto.show', { timeout: 10000 }).catch(() => {
-    console.log('Contact section may already be visible or skipped');
+  // Step B: Handle Photos accordion (upload photos when it becomes visible)
+  console.log('Step B: Photos accordion...');
+  await page.waitForSelector('#collapseFotos.show', { timeout: 10000 }).catch(() => {
+    console.log('Photos accordion not visible, may not be required');
   });
 
-  // Click the main Siguiente button at the bottom (.form-actions)
-  const mainSiguienteClicked = await page.evaluate(() => {
-    // Target specifically the form-actions container at the bottom
-    const formActions = document.querySelector('.form-actions.mt-50');
+  const photosVisible = await page.evaluate(() => {
+    const el = document.querySelector('#collapseFotos');
+    return el && el.classList.contains('show');
+  });
+
+  if (photosVisible) {
+    console.log('Photos accordion is visible');
+
+    // Check if photos are required (button is disabled)
+    const photosRequired = await page.evaluate(() => {
+      const btn = document.querySelector('#collapseFotos button.btn-default, #collapseFotos button.btn-primary');
+      return btn && btn.disabled;
+    });
+
+    if (data.photos && data.photos.length > 0) {
+      console.log(`Uploading ${data.photos.length} photo(s)...`);
+
+      for (let i = 0; i < Math.min(data.photos.length, 3); i++) {
+        const photoPath = data.photos[i];
+        console.log(`  Uploading photo ${i + 1}: ${photoPath}`);
+
+        try {
+          const fileInputs = await page.$$('input[type="file"]#file-upload');
+          if (fileInputs.length > i) {
+            await fileInputs[i].uploadFile(photoPath);
+            console.log(`  Photo ${i + 1} uploaded`);
+            await delay(2000);
+          }
+        } catch (uploadError) {
+          console.log(`  Failed to upload photo ${i + 1}:`, uploadError.message);
+        }
+      }
+      await page.screenshot({ path: 'debug-after-photo-upload.png', fullPage: true });
+    } else if (photosRequired) {
+      console.log('WARNING: Photos are required for this report type but none provided');
+      throw new Error('Este tipo de reporte requiere foto. Por favor, enviá una foto.');
+    }
+
+    // Click Siguiente in photos accordion
+    const photosResult = await clickAccordionButton(page, '#collapseFotos');
+    console.log(`Photos accordion: ${JSON.stringify(photosResult)}`);
+    if (photosResult.success) {
+      await delay(2000);
+    }
+  }
+
+  // Step C: Handle Contact accordion (may need radio selection)
+  console.log('Step C: Contact accordion...');
+
+  // Wait a bit for the accordion to open
+  await delay(2000);
+
+  // Check what accordions are currently visible
+  const accordionState = await page.evaluate(() => {
+    const accordions = document.querySelectorAll('.accordion-collapse');
+    const states = [];
+    for (const acc of accordions) {
+      states.push({
+        id: acc.id,
+        isOpen: acc.classList.contains('show'),
+        text: acc.innerText.substring(0, 100)
+      });
+    }
+    return states;
+  });
+  console.log('Accordion states:', JSON.stringify(accordionState, null, 2));
+
+  // If Contact accordion is open, check if it needs interaction
+  const contactVisible = accordionState.find(a => a.id === 'collapseSolicitudContacto' && a.isOpen);
+  if (contactVisible) {
+    console.log('Contact accordion is open - checking for required selections...');
+    await page.screenshot({ path: 'debug-contact-accordion.png', fullPage: true });
+
+    // Check if there are radio buttons that need to be selected (email, phone, etc.)
+    const contactInteraction = await page.evaluate(() => {
+      const accordion = document.querySelector('#collapseSolicitudContacto');
+      if (!accordion) return { action: 'none' };
+
+      // Check for unselected radio buttons
+      const radioGroups = accordion.querySelectorAll('input[type="radio"]');
+      const radioSelected = accordion.querySelector('input[type="radio"]:checked');
+
+      if (radioGroups.length > 0 && !radioSelected) {
+        // Need to select a radio option - prefer "Correo electrónico" (email)
+        const labels = accordion.querySelectorAll('label');
+        for (const label of labels) {
+          const text = label.textContent.trim().toLowerCase();
+          if (text.includes('correo') || text.includes('email')) {
+            // Find the associated radio input and click
+            const radio = label.querySelector('input[type="radio"]') ||
+                         document.getElementById(label.getAttribute('for'));
+            if (radio) {
+              label.click();
+              return { action: 'selected_email', text: label.textContent.trim() };
+            }
+          }
+        }
+        // If no email option, select the first option
+        if (radioGroups[0]) {
+          const firstLabel = radioGroups[0].closest('label') ||
+                            accordion.querySelector(`label[for="${radioGroups[0].id}"]`);
+          if (firstLabel) {
+            firstLabel.click();
+            return { action: 'selected_first', text: firstLabel.textContent.trim() };
+          }
+          radioGroups[0].click();
+          return { action: 'clicked_radio', text: 'first option' };
+        }
+      }
+
+      // Check for checkboxes that need to be checked
+      const checkboxes = accordion.querySelectorAll('input[type="checkbox"]:not(:checked)');
+      for (const checkbox of checkboxes) {
+        const label = checkbox.closest('label') ||
+                     accordion.querySelector(`label[for="${checkbox.id}"]`);
+        if (label) {
+          checkbox.click();
+          return { action: 'checked_checkbox', text: label.textContent.trim() };
+        }
+      }
+
+      // Check if Siguiente button is disabled (means something still needs to be done)
+      const siguienteBtn = accordion.querySelector('button');
+      if (siguienteBtn && siguienteBtn.disabled) {
+        // Look for any empty required inputs
+        const inputs = accordion.querySelectorAll('input:not([type="radio"]):not([type="checkbox"])');
+        for (const input of inputs) {
+          if (input.required && !input.value) {
+            return { action: 'needs_input', field: input.placeholder || input.name || 'unknown' };
+          }
+        }
+        return { action: 'button_disabled', reason: 'unknown requirement' };
+      }
+
+      return { action: 'ready', radioSelected: !!radioSelected };
+    });
+
+    console.log('Contact accordion interaction:', JSON.stringify(contactInteraction));
+
+    if (contactInteraction.action === 'needs_input') {
+      throw new Error(`Formulario de contacto incompleto: falta ${contactInteraction.field}`);
+    }
+
+    if (contactInteraction.action !== 'none') {
+      await delay(1000); // Wait for any selection to register
+    }
+  }
+
+  // Try clicking any Siguiente button in the Contact accordion
+  const contactResult = await clickAccordionButton(page, '#collapseSolicitudContacto');
+  console.log(`Contact accordion: ${JSON.stringify(contactResult)}`);
+
+  await delay(1000);
+
+  // Now click the main Siguiente/Confirmar button at the bottom
+  console.log('Looking for main submit button...');
+  await page.screenshot({ path: 'debug-before-submit.png', fullPage: true });
+
+  // Try to find and click any available submit button
+  const submitResult = await page.evaluate(() => {
+    // Look for form-actions container first
+    const formActions = document.querySelector('.form-actions, .form-actions.mt-50');
     if (formActions) {
-      const btn = formActions.querySelector('button.btn-primary');
-      if (btn && btn.textContent.includes('Siguiente')) {
-        console.log('Found main Siguiente button in form-actions');
+      const btn = formActions.querySelector('button.btn-primary:not([disabled])');
+      if (btn) {
         btn.click();
-        return { success: true, method: 'form-actions' };
+        return { success: true, method: 'form-actions', text: btn.textContent.trim() };
       }
     }
 
-    // Fallback: find the Siguiente button that's NOT inside an accordion
-    const allButtons = document.querySelectorAll('button.btn-primary');
-    for (const btn of allButtons) {
+    // Look for any primary button with Siguiente or Confirmar
+    const buttons = document.querySelectorAll('button.btn-primary:not([disabled])');
+    for (const btn of buttons) {
       const text = btn.textContent || '';
-      if (text.includes('Siguiente')) {
-        // Check if it's inside an accordion-body (skip those)
-        const isInAccordion = btn.closest('.accordion-body');
-        if (!isInAccordion) {
-          console.log('Found Siguiente button outside accordion');
-          btn.click();
-          return { success: true, method: 'fallback' };
-        }
+      const isInAccordion = btn.closest('.accordion-body');
+      if (!isInAccordion && (text.includes('Siguiente') || text.includes('Confirmar'))) {
+        btn.click();
+        return { success: true, method: 'fallback', text: text.trim() };
       }
     }
+
     return { success: false };
   });
 
-  console.log('Main Siguiente click result:', mainSiguienteClicked);
+  console.log('Submit button result:', submitResult);
 
   await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {
-    console.log('Navigation timeout after main Siguiente');
+    console.log('Navigation timeout after submit');
   });
   await delay(3000);
 
   await page.screenshot({ path: 'debug-after-form.png', fullPage: true });
 
-  // Step 11: Confirmation page - click "Confirmar"
-  console.log('Step 11: Final confirmation...');
+  // Step 11: Intelligent final step - analyze page and decide what to do
+  console.log('Step 11: Analyzing page for final action...');
   await page.screenshot({ path: 'debug-before-confirm.png', fullPage: true });
 
-  const confirmed = await page.evaluate(() => {
-    const buttons = document.querySelectorAll('button.btn-primary');
-    for (const btn of buttons) {
-      if ((btn.textContent || '').includes('Confirmar')) {
-        btn.click();
-        return true;
-      }
-    }
-    return false;
-  });
+  // Use Claude to analyze the full page and decide what to do
+  let previousMainText = '';
+  let actionsTried = []; // Track what we've tried to avoid repeating
+  let stuckCount = 0;
 
-  if (!confirmed) {
-    throw new Error('Could not find final Confirmar button');
+  for (let attempt = 0; attempt < 10; attempt++) {  // Increased to allow recovery attempts
+    const pageContext = await page.evaluate(() => {
+      // Get FULL body text to see everything
+      const bodyText = document.body.innerText;
+
+      // Also get the main content area specifically
+      const mainContent = document.querySelector('main, .main-container, [role="main"]');
+      const mainText = mainContent ? mainContent.innerText : bodyText;
+
+      // Get visible accordions/sections
+      const visibleAccordions = Array.from(document.querySelectorAll('.accordion-collapse.show')).map(a => ({
+        id: a.id,
+        text: a.innerText.substring(0, 300)
+      }));
+
+      // Check for error messages
+      const errorElements = document.querySelectorAll('.alert-danger, .error, .invalid-feedback, .text-danger');
+      const errors = Array.from(errorElements).map(e => e.innerText.trim()).filter(t => t);
+
+      // Get form actions area
+      const formActions = document.querySelector('.form-actions');
+      const formActionsText = formActions ? formActions.innerText : '';
+
+      return {
+        url: window.location.href,
+        title: document.title,
+        bodyText: bodyText.substring(0, 5000),
+        mainText: mainText.substring(0, 3000),
+        visibleAccordions,
+        errors,
+        formActionsText,
+        buttons: Array.from(document.querySelectorAll('button:not([disabled])')).map(b => ({
+          text: b.textContent.trim().substring(0, 50),
+          classes: b.className
+        })),
+        hasSuccess: bodyText.includes('éxito') || bodyText.includes('ingresada') || bodyText.includes('solicitud fue'),
+        hasConfirmar: bodyText.includes('Confirmar')
+      };
+    });
+
+    console.log(`[Final Step] Attempt ${attempt + 1}, URL: ${pageContext.url}`);
+    console.log(`[Final Step] Visible accordions: ${JSON.stringify(pageContext.visibleAccordions.map(a => a.id))}`);
+    console.log(`[Final Step] Errors: ${JSON.stringify(pageContext.errors)}`);
+    console.log(`[Final Step] Form actions: ${pageContext.formActionsText}`);
+    console.log(`[Final Step] Body text preview: ${pageContext.bodyText.substring(0, 500)}...`);
+
+    // Check if page is stuck (same content as before)
+    const isStuck = previousMainText && pageContext.mainText.substring(0, 500) === previousMainText.substring(0, 500);
+    if (isStuck) {
+      stuckCount++;
+      console.log(`[Final Step] Page appears stuck (${stuckCount} times) - DEEP DIAGNOSIS`);
+
+      // FIRST: Do a deep inspection of ALL accordions
+      const accordionInspection = await inspectAllAccordions(page);
+      console.log('[Final Step] ACCORDION INSPECTION:', JSON.stringify(accordionInspection, null, 2));
+
+      // SECOND: Try clicking the button while capturing network requests
+      console.log('[Final Step] Capturing network activity during button click...');
+      const networkResult = await captureNetworkDuringAction(page, async () => {
+        await page.evaluate(() => {
+          const btn = document.querySelector('.form-actions button.btn-primary:not([disabled])');
+          if (btn) {
+            btn.click();
+            return true;
+          }
+          return false;
+        });
+      }, 3000);
+
+      if (networkResult.requests.length > 0 || networkResult.responses.length > 0) {
+        console.log('[Final Step] NETWORK REQUESTS:', JSON.stringify(networkResult.requests, null, 2));
+        console.log('[Final Step] NETWORK RESPONSES:', JSON.stringify(networkResult.responses, null, 2));
+      } else {
+        console.log('[Final Step] NO NETWORK ACTIVITY - button click may not be triggering form submission');
+      }
+
+      if (networkResult.errors.length > 0) {
+        console.log('[Final Step] PAGE ERRORS:', networkResult.errors);
+      }
+
+      // THIRD: Check if any accordion has incomplete fields
+      if (!accordionInspection.summary.allComplete) {
+        console.log(`[Final Step] FOUND INCOMPLETE SECTION: ${accordionInspection.summary.incompleteSection}`);
+        console.log(`[Final Step] MISSING FIELDS: ${accordionInspection.summary.missingFields.join(', ')}`);
+      }
+
+      // Now do the standard diagnostics
+      const diagnostics = await page.evaluate(() => {
+        const results = {
+          formValidation: null,
+          requiredFields: [],
+          buttonState: null,
+          angularErrors: [],
+          hiddenErrors: []
+        };
+
+        // Check Angular form validation (ng-invalid classes)
+        const invalidFields = document.querySelectorAll('.ng-invalid, [aria-invalid="true"], .is-invalid');
+        results.requiredFields = Array.from(invalidFields).map(el => ({
+          tag: el.tagName,
+          name: el.name || el.id || el.placeholder || 'unknown',
+          value: el.value || '',
+          classes: el.className
+        })).filter(f => f.tag === 'INPUT' || f.tag === 'TEXTAREA' || f.tag === 'SELECT');
+
+        // Check form validity
+        const forms = document.querySelectorAll('form');
+        for (const form of forms) {
+          if (!form.checkValidity()) {
+            results.formValidation = 'Form is invalid';
+          }
+        }
+
+        // Check the Siguiente button state in detail
+        const accordions = document.querySelectorAll('.accordion-collapse.show');
+        for (const accordion of accordions) {
+          const btn = accordion.querySelector('button');
+          if (btn && btn.textContent.includes('Siguiente')) {
+            results.buttonState = {
+              text: btn.textContent.trim(),
+              disabled: btn.disabled,
+              classes: btn.className,
+              type: btn.type,
+              form: btn.form ? 'has form' : 'no form',
+              onclick: btn.onclick ? 'has onclick' : 'no onclick'
+            };
+          }
+        }
+
+        // Also check main form-actions button
+        const formActions = document.querySelector('.form-actions');
+        if (formActions) {
+          const mainBtn = formActions.querySelector('button.btn-primary');
+          if (mainBtn) {
+            results.mainButtonState = {
+              text: mainBtn.textContent.trim(),
+              disabled: mainBtn.disabled,
+              classes: mainBtn.className
+            };
+          }
+        }
+
+        // Look for hidden validation errors (not just visible ones)
+        const allValidationMsgs = document.querySelectorAll('[class*="invalid"], [class*="error"], [class*="validation"]');
+        results.hiddenErrors = Array.from(allValidationMsgs)
+          .map(el => el.innerText.trim())
+          .filter(t => t && t.length > 0 && t.length < 200);
+
+        // Check for Angular-specific error states
+        const ngMessages = document.querySelectorAll('ng-message, [ng-message], .help-block');
+        results.angularErrors = Array.from(ngMessages).map(el => el.innerText.trim()).filter(t => t);
+
+        return results;
+      });
+
+      console.log('[Final Step] DIAGNOSTICS:', JSON.stringify(diagnostics, null, 2));
+
+      // If we found form validation issues, report them instead of blindly retrying
+      if (diagnostics.requiredFields.length > 0) {
+        const emptyFields = diagnostics.requiredFields.filter(f => !f.value || f.value.trim() === '');
+        if (emptyFields.length > 0) {
+          console.log('[Final Step] FOUND EMPTY REQUIRED FIELDS:', emptyFields.map(f => f.name).join(', '));
+        }
+      }
+
+      if (diagnostics.hiddenErrors.length > 0) {
+        console.log('[Final Step] HIDDEN VALIDATION ERRORS:', diagnostics.hiddenErrors);
+      }
+
+      // Early termination: if button is clearly disabled, throw error immediately
+      if (diagnostics.buttonState?.disabled || diagnostics.mainButtonState?.disabled) {
+        const emptyFields = diagnostics.requiredFields.filter(f => !f.value || f.value.trim() === '');
+        if (emptyFields.length > 0) {
+          throw new Error(`Formulario incompleto: faltan campos obligatorios (${emptyFields.map(f => f.name).join(', ')})`);
+        }
+        if (diagnostics.hiddenErrors.length > 0) {
+          throw new Error(`Error de validación: ${diagnostics.hiddenErrors[0]}`);
+        }
+      }
+
+      // Use Claude Vision to analyze the situation
+      console.log('[Final Step] Using Claude VISION to analyze screenshot...');
+
+      // Take a fresh screenshot
+      const screenshotPath = path.join(__dirname, 'debug-vision-analysis.png');
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+
+      // Read screenshot as base64
+      const screenshotBase64 = fs.readFileSync(screenshotPath).toString('base64');
+
+      // Also get HTML context for buttons and page structure
+      const htmlContext = await page.evaluate(() => {
+        const allButtons = Array.from(document.querySelectorAll('button:not([disabled])')).map(btn => ({
+          text: btn.textContent.trim().substring(0, 50),
+          classes: btn.className,
+          inModal: !!btn.closest('.modal'),
+          inAccordion: !!btn.closest('.accordion-collapse'),
+          accordionId: btn.closest('.accordion-collapse')?.id || null
+        }));
+
+        const openAccordions = Array.from(document.querySelectorAll('.accordion-collapse.show')).map(a => a.id);
+
+        const mainText = (document.querySelector('main') || document.body).innerText.substring(0, 1500);
+
+        return { allButtons, openAccordions, mainText, url: window.location.href };
+      });
+
+      const visionPrompt = `Estás automatizando un formulario del gobierno de Buenos Aires (BA Colaborativa).
+
+MIRÁ LA IMAGEN y también usá el contexto HTML para decirme EXACTAMENTE qué hacer.
+
+URL ACTUAL: ${htmlContext.url}
+
+📋 ESTADO DE TODAS LAS SECCIONES:
+${accordionInspection.accordions.map(a => {
+  let status = a.isOpen ? '🔓 ABIERTO' : '🔒 CERRADO';
+  if (a.hasCheckmark) status += ' ✅';
+  if (a.hasWarning) status += ' ⚠️';
+  let info = `- ${a.id}: ${status}`;
+  if (a.contents) {
+    if (a.contents.emptyFields.length > 0) {
+      info += `\n  ❌ CAMPOS VACÍOS: ${a.contents.emptyFields.join(', ')}`;
+    }
+    if (a.contents.buttonState) {
+      info += `\n  Botón: "${a.contents.buttonState.text}" (disabled: ${a.contents.buttonState.disabled})`;
+    }
+  }
+  return info;
+}).join('\n')}
+
+🌐 ACTIVIDAD DE RED AL CLICKEAR:
+- Requests: ${networkResult.requests.length > 0 ? networkResult.requests.map(r => `${r.method} ${r.url.split('/').pop()}`).join(', ') : 'NINGUNA'}
+- Responses: ${networkResult.responses.length > 0 ? networkResult.responses.map(r => `${r.status}`).join(', ') : 'NINGUNA'}
+- Errores: ${networkResult.errors.length > 0 ? networkResult.errors.join(', ') : 'ninguno'}
+
+⚠️ DIAGNÓSTICO DE FORMULARIO:
+- Campos inválidos: ${diagnostics.requiredFields.length > 0 ? diagnostics.requiredFields.map(f => `${f.name}${f.value ? '=' + f.value : ' (VACÍO)'}`).join(', ') : 'ninguno'}
+- Estado del botón principal: ${diagnostics.mainButtonState ? JSON.stringify(diagnostics.mainButtonState) : 'no encontrado'}
+- Errores ocultos: ${diagnostics.hiddenErrors.length > 0 ? diagnostics.hiddenErrors.join(', ') : 'ninguno'}
+
+ANÁLISIS:
+- El botón "Siguiente" YA FUE CLICKEADO ${stuckCount} VECES y la página NO AVANZÓ
+- Si hubo requests de red pero sin respuesta o con error, hay problema de backend
+- Si NO hubo requests de red, el formulario no está validando correctamente
+- Revisá las secciones arriba - si alguna tiene "CAMPOS VACÍOS", ESA es la que hay que completar
+
+Respondé SOLO con JSON:
+{"action": "fill", "field": "nombre del campo", "value": "qué poner"} - si hay campo vacío que llenar
+{"action": "go_back", "section": "cuestionario|fotos|contacto", "reason": "explicación"} - si una sección anterior está incompleta
+{"action": "click", "buttonText": "texto exacto", "location": "dónde"} - SOLO si el problema fue resuelto
+{"action": "open_accordion", "accordionName": "nombre de la sección"} - si hay que abrir un accordion cerrado
+{"action": "done", "reason": "solicitud completada"} - si ya terminamos
+{"action": "error", "message": "descripción"} - SOLO si es un error IRRECUPERABLE (ej: sesión expirada)`;
+
+      try {
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 300,
+          messages: [{
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/png',
+                  data: screenshotBase64
+                }
+              },
+              {
+                type: 'text',
+                text: visionPrompt
+              }
+            ]
+          }]
+        });
+
+        const responseText = response.content[0].text;
+        console.log('[Final Step] Claude VISION response:', responseText);
+
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const instruction = JSON.parse(jsonMatch[0]);
+
+          if (instruction.action === 'done') {
+            console.log('[Final Step] Claude Vision says we are done!');
+            break;
+          }
+
+          if (instruction.action === 'error') {
+            // Only throw for truly unrecoverable errors
+            console.log(`[Final Step] Claude Vision reports error: ${instruction.message}`);
+            if (instruction.message.toLowerCase().includes('sesión') ||
+                instruction.message.toLowerCase().includes('expirad') ||
+                instruction.message.toLowerCase().includes('login')) {
+              throw new Error(instruction.message);
+            }
+            // For other "errors", try to recover by going back
+            console.log('[Final Step] Attempting recovery by going back...');
+            instruction.action = 'go_back';
+            instruction.section = 'cuestionario';
+            instruction.reason = instruction.message;
+          }
+
+          if (instruction.action === 'go_back') {
+            console.log(`[Final Step] Going back to complete: ${instruction.section} (${instruction.reason})`);
+
+            // Click "Anterior" button to go back
+            const wentBack = await page.evaluate(() => {
+              const buttons = document.querySelectorAll('button');
+              for (const btn of buttons) {
+                if (btn.textContent.includes('Anterior') && !btn.disabled) {
+                  btn.click();
+                  return true;
+                }
+              }
+              return false;
+            });
+
+            if (wentBack) {
+              console.log('[Final Step] Clicked Anterior, waiting for page update...');
+              await delay(3000);
+
+              // Take screenshot to see what happened
+              await page.screenshot({ path: 'debug-after-anterior.png', fullPage: true });
+
+              // Do a DEEP inspection of ALL sections to see what we're dealing with
+              const deepInspection = await inspectAllAccordions(page);
+              console.log('[Final Step] AFTER ANTERIOR - Accordion states:');
+              for (const acc of deepInspection.accordions) {
+                console.log(`  - ${acc.id}: isOpen=${acc.isOpen}, hasCheckmark=${acc.hasCheckmark}, hasWarning=${acc.hasWarning}`);
+                if (acc.contents) {
+                  console.log(`    Contents: ${acc.contents.innerText.substring(0, 100)}...`);
+                  if (acc.contents.emptyFields.length > 0) {
+                    console.log(`    EMPTY FIELDS: ${acc.contents.emptyFields.join(', ')}`);
+                  }
+                }
+              }
+
+              // Map section names to selectors
+              const sectionMap = {
+                'cuestionario': '#collapseCuestionario',
+                'fotos': '#collapseFotos',
+                'contacto': '#collapseSolicitudContacto',
+                'descripcion': '#collapseDescribirSituacion'
+              };
+
+              const targetSelector = sectionMap[instruction.section] || '#collapseCuestionario';
+
+              // Force open the target section if it's not already open
+              let isTargetOpen = await page.evaluate((selector) => {
+                const el = document.querySelector(selector);
+                return el && el.classList.contains('show');
+              }, targetSelector);
+
+              if (!isTargetOpen) {
+                console.log(`[Final Step] Target section ${targetSelector} is NOT open, forcing open...`);
+
+                // Try multiple ways to open the accordion
+                const openResult = await page.evaluate((selector) => {
+                  const accordion = document.querySelector(selector);
+                  if (!accordion) return { error: 'Accordion not found' };
+
+                  // Method 1: Click the header button
+                  const accordionItem = accordion.closest('.accordion-item');
+                  if (accordionItem) {
+                    const headerBtn = accordionItem.querySelector('.accordion-button, .accordion-header button, button[data-bs-toggle]');
+                    if (headerBtn) {
+                      headerBtn.click();
+                      return { method: 'header button click', success: true };
+                    }
+                  }
+
+                  // Method 2: Find header by replacing 'collapse' with 'heading' in ID
+                  const headerId = selector.replace('#collapse', '#heading');
+                  const header = document.querySelector(headerId);
+                  if (header) {
+                    const btn = header.querySelector('button') || header;
+                    btn.click();
+                    return { method: 'heading ID click', success: true };
+                  }
+
+                  // Method 3: Click previous sibling
+                  const prevSibling = accordion.previousElementSibling;
+                  if (prevSibling) {
+                    const btn = prevSibling.querySelector('button') || prevSibling;
+                    btn.click();
+                    return { method: 'previous sibling click', success: true };
+                  }
+
+                  // Method 4: Directly manipulate Bootstrap collapse
+                  accordion.classList.add('show');
+                  return { method: 'direct class manipulation', success: true };
+                }, targetSelector);
+
+                console.log('[Final Step] Open result:', openResult);
+                await delay(2000);
+
+                // Verify it's now open
+                isTargetOpen = await page.evaluate((selector) => {
+                  const el = document.querySelector(selector);
+                  return el && el.classList.contains('show');
+                }, targetSelector);
+
+                console.log(`[Final Step] After forcing open: isTargetOpen = ${isTargetOpen}`);
+              }
+
+              // Take screenshot after opening
+              await page.screenshot({ path: 'debug-after-force-open.png', fullPage: true });
+
+              // Now do a deep inspection of the target section specifically
+              const sectionContents = await page.evaluate((selector) => {
+                const accordion = document.querySelector(selector);
+                if (!accordion) return { error: 'Section not found' };
+
+                const body = accordion.querySelector('.accordion-body') || accordion;
+                const text = body.innerText;
+
+                // Get all interactive elements
+                const inputs = Array.from(body.querySelectorAll('input:not([type="hidden"])')).map(i => ({
+                  type: i.type,
+                  name: i.name || i.id || i.placeholder,
+                  value: i.value,
+                  checked: i.checked,
+                  required: i.required,
+                  invalid: i.classList.contains('ng-invalid')
+                }));
+
+                const textareas = Array.from(body.querySelectorAll('textarea')).map(t => ({
+                  name: t.name || t.placeholder,
+                  value: t.value,
+                  required: t.required,
+                  invalid: t.classList.contains('ng-invalid')
+                }));
+
+                const buttons = Array.from(body.querySelectorAll('button')).map(b => ({
+                  text: b.textContent.trim(),
+                  disabled: b.disabled
+                }));
+
+                return {
+                  isOpen: accordion.classList.contains('show'),
+                  text: text.substring(0, 500),
+                  inputs,
+                  textareas,
+                  buttons
+                };
+              }, targetSelector);
+
+              console.log('[Final Step] Section contents:', JSON.stringify(sectionContents, null, 2));
+
+              // If we went back to questionnaire, try to complete it
+              if (instruction.section === 'cuestionario' || targetSelector.includes('Cuestionario')) {
+                console.log('[Final Step] Re-running questionnaire completion...');
+
+                // Check what's actually in the questionnaire
+                if (sectionContents.inputs.length === 0 && sectionContents.textareas.length === 0) {
+                  console.log('[Final Step] WARNING: No form elements found in questionnaire section!');
+
+                  // Maybe it's a different accordion structure - try to find any open form section
+                  const anyFormSection = await page.evaluate(() => {
+                    const openAccordions = document.querySelectorAll('.accordion-collapse.show');
+                    for (const acc of openAccordions) {
+                      const body = acc.querySelector('.accordion-body') || acc;
+                      const hasInputs = body.querySelectorAll('input, textarea').length > 0;
+                      if (hasInputs) {
+                        return {
+                          id: acc.id,
+                          text: body.innerText.substring(0, 200)
+                        };
+                      }
+                    }
+                    return null;
+                  });
+
+                  if (anyFormSection) {
+                    console.log(`[Final Step] Found form section: ${anyFormSection.id}`);
+                    console.log(`[Final Step] Content: ${anyFormSection.text}`);
+                  }
+                }
+
+                // Try to complete the questionnaire with available data
+                for (let qStep = 0; qStep < 5; qStep++) {
+                  const hasQuestionnaire = await page.evaluate(() => {
+                    return !!document.querySelector('#collapseCuestionario.show');
+                  });
+
+                  if (!hasQuestionnaire) {
+                    console.log('[Final Step] Questionnaire section closed, checking if complete...');
+
+                    // Check if there's a checkmark indicating completion
+                    const isComplete = await page.evaluate(() => {
+                      const item = document.querySelector('#collapseCuestionario')?.closest('.accordion-item');
+                      if (item) {
+                        return item.querySelector('.fa-check, .bi-check, [class*="check"]') !== null;
+                      }
+                      return false;
+                    });
+
+                    console.log(`[Final Step] Questionnaire appears complete: ${isComplete}`);
+                    break;
+                  }
+
+                  // Use the same logic as analyzeAndFillForm
+                  const action = await analyzeAndFillForm(page, availableData);
+                  console.log('[Final Step] Questionnaire action:', action);
+
+                  if (action.action === 'done' || !action) break;
+
+                  await executeFormAction(page, action);
+                  await page.screenshot({ path: `debug-recovery-q-step-${qStep}.png`, fullPage: true });
+                }
+              }
+
+              // Reset stuck count since we're taking new action
+              stuckCount = 0;
+              previousMainText = '';
+            }
+            continue;
+          }
+
+          if (instruction.action === 'open_accordion') {
+            console.log(`[Final Step] Opening accordion: ${instruction.accordionName}`);
+
+            const opened = await page.evaluate((name) => {
+              // Try to find accordion by partial text match
+              const headers = document.querySelectorAll('.accordion-header, .accordion-button, [data-bs-toggle="collapse"]');
+              for (const header of headers) {
+                if (header.textContent.toLowerCase().includes(name.toLowerCase())) {
+                  header.click();
+                  return { success: true, text: header.textContent.trim() };
+                }
+              }
+              return { success: false };
+            }, instruction.accordionName);
+
+            console.log('[Final Step] Accordion open result:', opened);
+            await delay(2000);
+            stuckCount = 0;
+            previousMainText = '';
+            continue;
+          }
+
+          if (instruction.action === 'click' && instruction.buttonText) {
+            console.log(`[Final Step] Claude Vision says click: "${instruction.buttonText}" at ${instruction.location}`);
+            const clicked = await page.evaluate((btnText) => {
+              const buttons = document.querySelectorAll('button:not([disabled])');
+              for (const btn of buttons) {
+                if (btn.textContent.trim().includes(btnText) || btn.textContent.trim() === btnText) {
+                  btn.click();
+                  return { clicked: true, text: btn.textContent.trim() };
+                }
+              }
+              // Also try links
+              const links = document.querySelectorAll('a');
+              for (const link of links) {
+                if (link.textContent.trim().includes(btnText)) {
+                  link.click();
+                  return { clicked: true, text: link.textContent.trim(), type: 'link' };
+                }
+              }
+              return { clicked: false };
+            }, instruction.buttonText);
+
+            console.log(`[Final Step] Vision instruction executed:`, clicked);
+            await delay(3000);
+            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
+            continue;
+          }
+
+          if (instruction.action === 'fill' && instruction.field) {
+            console.log(`[Final Step] Claude Vision says fill: "${instruction.field}" with "${instruction.value}"`);
+            // Try to fill the field
+            await page.evaluate((fieldName, value) => {
+              const inputs = document.querySelectorAll('input, textarea');
+              for (const input of inputs) {
+                const label = input.closest('div')?.querySelector('label')?.textContent || '';
+                if (label.toLowerCase().includes(fieldName.toLowerCase()) || input.placeholder?.toLowerCase().includes(fieldName.toLowerCase())) {
+                  input.value = value;
+                  input.dispatchEvent(new Event('input', { bubbles: true }));
+                  return true;
+                }
+              }
+              return false;
+            }, instruction.field, instruction.value);
+            await delay(1000);
+            continue;
+          }
+        }
+      } catch (e) {
+        console.error('[Final Step] Claude Vision error:', e.message);
+        // If vision fails after multiple attempts, give up
+        if (stuckCount >= 3) {
+          throw new Error(`Formulario atascado después de ${stuckCount} intentos con visión. Verificar manualmente: ${pageContext.url}`);
+        }
+      }
+      continue;
+    } else {
+      stuckCount = 0; // Reset if page changed
+    }
+    previousMainText = pageContext.mainText;
+
+    // Check if we already succeeded
+    if (pageContext.hasSuccess) {
+      console.log('[Final Step] Success detected on page!');
+      break;
+    }
+
+    // THINK: Check what page we're on and what action to take
+    const confirmationCheck = await page.evaluate(() => {
+      const bodyText = document.body.innerText || '';
+
+      // Are we on the REVIEW page? ("Revisá y confirmá la información de tu solicitud")
+      const isReviewPage = bodyText.includes('Revisá y confirmá') ||
+                           bodyText.includes('Confirmar') && bodyText.includes('Cancelar') && bodyText.includes('Modificar');
+
+      // PRIORITIZE: Look for "Confirmar" button in the main content (NOT in modals)
+      const mainContent = document.querySelector('main, .main-container, [role="main"]');
+      if (mainContent) {
+        const mainButtons = mainContent.querySelectorAll('button:not([disabled])');
+        for (const btn of mainButtons) {
+          const text = btn.textContent.trim();
+          const inModal = !!btn.closest('.modal, [role="dialog"]');
+          const inAccordion = !!btn.closest('.accordion-collapse');
+
+          // Found "Confirmar" in main content (not modal, not accordion) - THIS IS THE ONE
+          if (text === 'Confirmar' && !inModal && !inAccordion) {
+            return { hasConfirmation: true, buttonText: 'Confirmar', source: 'main-content' };
+          }
+        }
+      }
+
+      // Only look for "Sí" if it's NOT in a cancellation modal
+      const buttons = document.querySelectorAll('button:not([disabled])');
+      for (const btn of buttons) {
+        const text = btn.textContent.trim();
+        const inAccordion = !!btn.closest('.accordion-collapse');
+        const inModal = !!btn.closest('.modal, [role="dialog"]');
+
+        // Check if this "Sí" is in a CANCELLATION modal - SKIP IT
+        if (text === 'Sí' && inModal) {
+          const modal = btn.closest('.modal, [role="dialog"], app-modal-simple');
+          const modalText = modal ? modal.innerText : '';
+          // Skip if modal mentions "cancelar" - it's asking to confirm cancellation!
+          if (modalText.toLowerCase().includes('cancelar') || modalText.toLowerCase().includes('perderán')) {
+            continue; // DON'T click this - it cancels the request!
+          }
+        }
+
+        // "Sí" button outside accordion and NOT in cancellation modal
+        if (text === 'Sí' && !inAccordion && !inModal) {
+          return { hasConfirmation: true, buttonText: 'Sí', source: 'standalone' };
+        }
+      }
+
+      return { hasConfirmation: false };
+    });
+
+    if (confirmationCheck.hasConfirmation) {
+      console.log(`[Final Step] Found confirmation button: "${confirmationCheck.buttonText}" (${confirmationCheck.source}) - clicking it!`);
+      await page.evaluate((btnText) => {
+        const buttons = document.querySelectorAll('button:not([disabled])');
+        for (const btn of buttons) {
+          if (btn.textContent.trim() === btnText) {
+            btn.click();
+            return true;
+          }
+        }
+        return false;
+      }, confirmationCheck.buttonText);
+      await delay(3000);
+      continue;
+    }
+
+    // Ask Claude what to do
+    const prompt = `Estás completando un formulario del gobierno de Buenos Aires. Analizá la página y decidí qué hacer.
+
+URL: ${pageContext.url}
+
+ERRORES EN PANTALLA: ${pageContext.errors.length > 0 ? pageContext.errors.join(', ') : 'Ninguno'}
+
+ACCORDIONS/SECCIONES VISIBLES: ${pageContext.visibleAccordions.map(a => a.id).join(', ') || 'Ninguno abierto'}
+
+ÁREA DE BOTONES: ${pageContext.formActionsText || 'No visible'}
+
+CONTENIDO COMPLETO DE LA PÁGINA:
+${pageContext.bodyText.substring(0, 2500)}
+
+BOTONES HABILITADOS:
+${pageContext.buttons.map(b => `- "${b.text}"`).join('\n')}
+
+¿Qué hacer? Respondé con UN JSON:
+
+1. Si hay errores de validación en pantalla: {"action": "error", "message": "el texto del error"}
+2. Si hay accordions abiertos que necesitan completarse: {"action": "fill_accordion", "accordion": "id del accordion"}
+3. Si hay botón "Confirmar" visible: {"action": "click_button", "text": "Confirmar"}
+4. Si hay botón "Siguiente" y no hay accordions abiertos: {"action": "click_button", "text": "Siguiente"}
+5. Si la página dice "éxito", "ingresada", o muestra número de solicitud: {"action": "done", "success": true}
+6. Si la página parece atascada (mismo contenido después de click): {"action": "error", "message": "Formulario atascado - verificar manualmente"}
+
+IMPORTANTE: Si ves el mismo contenido que antes, NO sigas clickeando el mismo botón.
+
+Solo el JSON, nada más.`;
+
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 150,
+        messages: [{ role: 'user', content: prompt }]
+      });
+
+      const responseText = response.content[0].text;
+      console.log('[Final Step] Claude response:', responseText);
+
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const action = JSON.parse(jsonMatch[0]);
+
+        if (action.action === 'done') {
+          console.log('[Final Step] Complete!');
+          break;
+        }
+
+        if (action.action === 'click_button') {
+          const clicked = await page.evaluate((buttonText) => {
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+              if (btn.textContent.includes(buttonText) && !btn.disabled) {
+                btn.click();
+                return { clicked: true, text: btn.textContent.trim() };
+              }
+            }
+            return { clicked: false };
+          }, action.text);
+          console.log(`[Final Step] Clicked button: ${clicked.clicked ? clicked.text : 'NOT FOUND'}`);
+          await delay(3000);
+          continue;
+        }
+
+        if (action.action === 'fill_accordion') {
+          console.log(`[Final Step] Need to fill accordion: ${action.accordion}`);
+          // Try to click Siguiente in that accordion
+          await page.evaluate((accordionId) => {
+            const accordion = document.getElementById(accordionId) || document.querySelector(`#${accordionId}`);
+            if (accordion) {
+              const btn = accordion.querySelector('button');
+              if (btn && !btn.disabled) {
+                btn.click();
+                return true;
+              }
+            }
+            return false;
+          }, action.accordion);
+          await delay(2000);
+          continue;
+        }
+
+        if (action.action === 'error') {
+          throw new Error(action.message);
+        }
+      }
+    } catch (e) {
+      if (e.message && !e.message.includes('API')) {
+        throw e;
+      }
+      console.error('[Final Step] Claude error:', e.message);
+    }
+
+    await delay(2000);
   }
 
-  // Wait for success modal or redirect
-  await delay(5000);
   await page.screenshot({ path: 'debug-after-confirm.png', fullPage: true });
 
   // Check for success and extract solicitud number
@@ -781,6 +2034,37 @@ async function closeBrowser() {
   }
 }
 
+// Helper function to click accordion button (handles both btn-primary and btn-default)
+async function clickAccordionButton(page, accordionSelector) {
+  const result = await page.evaluate((selector) => {
+    const accordion = document.querySelector(selector);
+    if (!accordion) {
+      return { skipped: true, reason: 'not found' };
+    }
+
+    if (!accordion.classList.contains('show')) {
+      return { skipped: true, reason: 'not visible' };
+    }
+
+    // Find any Siguiente button (btn-primary, btn-default, btn-sm)
+    const buttons = accordion.querySelectorAll('button');
+    for (const btn of buttons) {
+      const text = btn.textContent || '';
+      if (text.includes('Siguiente')) {
+        if (btn.disabled) {
+          return { skipped: true, reason: 'button disabled' };
+        }
+        btn.click();
+        return { success: true, text: text.trim() };
+      }
+    }
+
+    return { skipped: true, reason: 'no Siguiente button' };
+  }, accordionSelector);
+
+  return result;
+}
+
 async function clickAccordionSiguiente(page, accordionSelector) {
   // Wait for the accordion section to be visible (has class 'show')
   const selectorWithShow = accordionSelector + '.show';
@@ -846,13 +2130,13 @@ app.post('/login', async (req, res) => {
 
 // Submit solicitud endpoint
 app.post('/solicitud', async (req, res) => {
-  const { address, containerType, description, photos, reportType } = req.body;
+  const { address, containerType, description, photos, reportType, schedule } = req.body;
 
   if (!address) {
     return res.status(400).json({ success: false, error: 'Address is required' });
   }
 
-  console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"`);
+  console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"${schedule ? `, schedule="${schedule}"` : ''}`);
 
   // Retry logic: if first attempt fails, close browser and try once more with fresh session
   const maxAttempts = 2;
@@ -864,7 +2148,7 @@ app.post('/solicitud', async (req, res) => {
         console.log(`\n=== RETRY ATTEMPT ${attempt}/${maxAttempts} with fresh browser session ===\n`);
       }
 
-      const result = await submitSolicitud({ address, containerType, description, photos, reportType });
+      const result = await submitSolicitud({ address, containerType, description, photos, reportType, schedule });
 
       // Close browser after successful submission
       await closeBrowser();
@@ -895,6 +2179,30 @@ app.post('/cleanup', async (req, res) => {
   await closeBrowser();
   res.json({ success: true, message: 'Browser closed' });
 });
+
+// Kill any existing process on the port (works on Mac and Linux)
+function killExistingProcess(port) {
+  try {
+    // Try lsof first (works on Mac and most Linux)
+    const pid = execSync(`lsof -ti:${port} 2>/dev/null || true`).toString().trim();
+    if (pid) {
+      console.log(`Killing existing process on port ${port} (PID: ${pid})...`);
+      execSync(`kill -9 ${pid} 2>/dev/null || true`);
+      // Brief delay to let the port free up
+      execSync('sleep 0.5');
+    }
+  } catch (e) {
+    // Try fuser as fallback (Linux)
+    try {
+      execSync(`fuser -k ${port}/tcp 2>/dev/null || true`);
+    } catch (e2) {
+      // Ignore errors - port may not be in use
+    }
+  }
+}
+
+// Kill any existing process before starting
+killExistingProcess(PORT);
 
 // Start server
 app.listen(PORT, () => {

@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import puppeteer from 'puppeteer';
 
 dotenv.config();
 
@@ -97,22 +98,42 @@ function getSystemPrompt() {
 
 class TrashReportBot {
   constructor() {
+    // Determine platform-specific settings
+    const isMac = process.platform === 'darwin';
+
+    // Mac-specific: use puppeteer's bundled Chromium, show browser, no single-process
+    // Linux: use original settings that work
+    const puppeteerConfig = isMac
+      ? {
+          headless: false, // Show browser on Mac for debugging
+          timeout: 60000,
+          executablePath: puppeteer.executablePath(), // Use puppeteer's Chromium
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage'
+          ]
+        }
+      : {
+          // Original Linux config - don't change what works
+          headless: true,
+          timeout: 60000,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+            '--disable-software-rasterizer',
+            '--disable-extensions',
+            '--no-first-run',
+            '--single-process'
+          ]
+        };
+
     this.client = new Client({
       authStrategy: new LocalAuth(),
-      puppeteer: {
-        headless: true,
-        timeout: 60000,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-gpu',
-          '--disable-dev-shm-usage',
-          '--disable-software-rasterizer',
-          '--disable-extensions',
-          '--no-first-run',
-          '--single-process' // Important for low-resource servers
-        ]
-      }
+      puppeteer: puppeteerConfig
     });
 
     this.chatCache = new Map();
@@ -348,12 +369,70 @@ class TrashReportBot {
       return;
     }
 
+    // Check if there's a pending info request waiting for user response
+    if (this.pendingInfoRequests?.has(senderId)) {
+      const pendingRequest = this.pendingInfoRequests.get(senderId);
+      const lastMessage = pending.messages[pending.messages.length - 1];
+      const awaitingField = pendingRequest.awaitingField;
+
+      console.log(`\n[Pending Info] Checking response for field: ${awaitingField}`);
+
+      // Handle based on what field we're waiting for
+      if (awaitingField === 'photo') {
+        // Looking for a photo
+        const photoMsg = pending.messages.find(m => m.photo);
+        if (photoMsg?.photo) {
+          console.log(`[Pending Info] User provided photo: ${photoMsg.photo}`);
+          pendingRequest.photo = photoMsg.photo;
+
+          this.pendingInfoRequests.delete(senderId);
+          pendingMessages.delete(senderId);
+
+          console.log(`[Pending Info] Resubmitting with photo`);
+          await this.submitRequest(pendingRequest);
+          return;
+        }
+      } else if (awaitingField === 'address' && lastMessage?.text) {
+        // Looking for address
+        console.log(`[Pending Info] User provided address: "${lastMessage.text}"`);
+        pendingRequest.address = lastMessage.text;
+
+        this.pendingInfoRequests.delete(senderId);
+        pendingMessages.delete(senderId);
+
+        console.log(`[Pending Info] Resubmitting with new address`);
+        await this.submitRequest(pendingRequest);
+        return;
+      } else if (lastMessage?.text) {
+        // Generic text response - likely schedule or other info
+        console.log(`[Pending Info] User responded: "${lastMessage.text}"`);
+
+        if (awaitingField === 'schedule' || pendingRequest.awaitingQuestion?.includes('horario') || pendingRequest.awaitingQuestion?.includes('días')) {
+          pendingRequest.schedule = lastMessage.text;
+        } else {
+          // Default: use as schedule
+          pendingRequest.schedule = lastMessage.text;
+        }
+
+        this.pendingInfoRequests.delete(senderId);
+        pendingMessages.delete(senderId);
+
+        console.log(`[Pending Info] Resubmitting with: schedule="${pendingRequest.schedule}"`);
+        await this.submitRequest(pendingRequest);
+        return;
+      }
+
+      // If we get here, user responded but not with what we needed
+      // Let the normal flow continue to re-analyze
+      console.log(`[Pending Info] Response didn't match expected field ${awaitingField}, continuing normal flow`);
+    }
+
     const photoCount = pending.messages.filter(m => m.photo).length;
     console.log(`\n[Processing] ${pending.senderName}: ${pending.messages.length} mensajes, ${photoCount} fotos`);
 
     try {
       // Use Claude to extract requests
-      const extraction = await this.extractRequests(pending);
+      const extraction = await this.extractRequests(pending, senderId);
 
       // Handle address corrections
       if (extraction.isCorrection && extraction.correctedAddress) {
@@ -401,9 +480,10 @@ class TrashReportBot {
           const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
           await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions });
           console.log(`  [Bot] @${pending.senderName} ${extraction.response}`);
-          // Reset messages but keep for follow-up
-          pending.messages = [];
+          // Keep messages for follow-up - don't clear them so Claude has context
+          // when the user responds to our question
           pending.timer = null;
+          pending.askedQuestion = true; // Mark that we asked a question
           return;
         }
         console.log('  [Bot] Nada actionable, ignorando');
@@ -486,6 +566,7 @@ class TrashReportBot {
               address: req.address,
               reportType: req.reportType || 'recoleccion',
               containerType: req.containerType || 'negro',
+              schedule: req.schedule || null, // For manteros: days/times
               photo,
               chat
             });
@@ -516,16 +597,27 @@ class TrashReportBot {
     }
   }
 
-  async extractRequests(pending) {
+  async extractRequests(pending, senderId) {
+      // Always use the user's last 10 messages for context (stored by phone number/senderId)
+      // This ensures Claude has full conversation history when user responds to questions
+      const userHistory = senderId ? (userMessageHistory.get(senderId) || []) : [];
+
+      // Use history if available, otherwise fall back to pending messages (for startup checks)
+      const messagesToProcess = userHistory.length > 0
+        ? userHistory.slice(-10)  // Last 10 messages from this user
+        : pending.messages;
+
+      console.log(`  [Context] User ${senderId?.split('@')[0] || 'unknown'}: ${messagesToProcess.length} messages`);
+
       // Build message list with text and photo indicators
-      const messagesWithPhotos = pending.messages.map((m, i) => {
+      const messagesWithPhotos = messagesToProcess.map((m, i) => {
         let desc = '';
         if (m.text) desc += m.text;
         if (m.photo) desc += desc ? ' [+FOTO]' : '[FOTO sin texto]';
         return `Msg${i + 1}: ${desc}`;
       }).join('\n');
 
-      const photos = pending.messages.filter(m => m.photo).map(m => m.photo);
+      const photos = messagesToProcess.filter(m => m.photo).map(m => m.photo);
       const hasPhotos = photos.length > 0;
 
       const prompt = `MENSAJES DE ${pending.senderName}:
@@ -540,8 +632,8 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
 
       // Add photos with labels for vision analysis
       if (hasPhotos) {
-        for (let i = 0; i < pending.messages.length; i++) {
-          const m = pending.messages[i];
+        for (let i = 0; i < messagesToProcess.length; i++) {
+          const m = messagesToProcess[i];
           if (m.photo) {
             try {
               const imageData = fs.readFileSync(m.photo);
@@ -647,7 +739,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
   }
 
   async submitRequest(request, isRetry = false) {
-    const { senderId, senderName, address, reportType = 'recoleccion', containerType, photo, chat } = request;
+    const { senderId, senderName, address, reportType = 'recoleccion', containerType, schedule, photo, chat } = request;
     const senderInfo = this.senderIdCache?.get(senderId);
     const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
     const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : `@${senderId.split('@')[0]}`;
@@ -671,6 +763,9 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     if (reportType === 'recoleccion') {
       console.log(`  Contenedor: ${containerType}`);
     }
+    if (reportType === 'manteros' && schedule) {
+      console.log(`  Horario: ${schedule}`);
+    }
     console.log('========================================\n');
 
     try {
@@ -682,6 +777,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
           address,
           reportType,
           containerType,
+          schedule, // For manteros: days/times when vendors are present
           photos: photo ? [photo] : []
         })
       });
@@ -717,6 +813,23 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         if (photo) {
           try { fs.unlinkSync(photo); } catch (e) {}
         }
+      } else if (result.needsInfo) {
+        // Form needs more information from user - ask them
+        console.log(`  [Bot] Form needs info: ${result.question}`);
+        await chat.sendMessage(`${mentionText} ${result.question}`, { mentions });
+
+        // Store pending request so we can continue when user responds
+        if (!this.pendingInfoRequests) {
+          this.pendingInfoRequests = new Map();
+        }
+        this.pendingInfoRequests.set(senderId, {
+          ...request,
+          awaitingField: result.field,
+          awaitingQuestion: result.question
+        });
+
+        // Don't clean up photo - we'll need it when we retry
+        return;
       } else {
         // Check if it's an access/login error
         const isAccessError = result.error && (
@@ -745,8 +858,82 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
             this.scheduleRetry(request);
           }
         } else {
-          await chat.sendMessage(`${mentionText} No pude mandar la solicitud para ${address}. Intentá de nuevo.`, { mentions });
-          console.log(`  [Bot] Error: ${result.error}`);
+          // Be agentic - analyze the error and ask for what we need
+          const error = result.error || '';
+          console.log(`  [Bot] Analyzing error: ${error}`);
+
+          // Try to understand what's missing and ask for it
+          let canRecover = false;
+          let questionToAsk = null;
+          let fieldNeeded = null;
+
+          // Check for specific missing info patterns - BE AGENTIC
+          if (error.toLowerCase().includes('foto') || error.toLowerCase().includes('imagen') || error.toLowerCase().includes('photo')) {
+            questionToAsk = '¿Podés mandarme una foto del problema?';
+            fieldNeeded = 'photo';
+            canRecover = true;
+          } else if (error.toLowerCase().includes('horario') || error.toLowerCase().includes('días') || error.toLowerCase().includes('schedule') || error.toLowerCase().includes('cuándo')) {
+            questionToAsk = '¿Qué días y horarios ocurre el problema?';
+            fieldNeeded = 'schedule';
+            canRecover = true;
+          } else if (error.toLowerCase().includes('dirección') || error.toLowerCase().includes('address') || error.toLowerCase().includes('ubicación')) {
+            questionToAsk = '¿Cuál es la dirección exacta?';
+            fieldNeeded = 'address';
+            canRecover = true;
+          } else if (error.toLowerCase().includes('textarea vacío') || error.toLowerCase().includes('campo requerido')) {
+            // Form has empty required field - figure out what it is
+            if (error.toLowerCase().includes('horario') || error.toLowerCase().includes('días')) {
+              questionToAsk = '¿Qué días y horarios ocurre el problema?';
+              fieldNeeded = 'schedule';
+            } else {
+              questionToAsk = '¿Podés darme más detalles sobre el problema?';
+              fieldNeeded = 'description';
+            }
+            canRecover = true;
+          } else if (error.toLowerCase().includes('radio sin seleccionar') || error.toLowerCase().includes('opciones')) {
+            // This is usually internal form issue - auto retry
+            this.scheduleRetry(request);
+            await chat.sendMessage(
+              `${mentionText} Hubo un problema con el formulario. Voy a reintentar automáticamente.`,
+              { mentions }
+            );
+            return;
+          } else if (error.toLowerCase().includes('confirmar') || error.toLowerCase().includes('button') || error.toLowerCase().includes('atascado')) {
+            // Form navigation error - can retry
+            questionToAsk = null;
+            canRecover = false;
+            // Schedule retry
+            this.scheduleRetry(request);
+            await chat.sendMessage(
+              `${mentionText} Hubo un problema técnico con el formulario. Voy a reintentar automáticamente.`,
+              { mentions }
+            );
+            return;
+          }
+
+          if (canRecover && questionToAsk) {
+            // Ask the user for the missing info
+            console.log(`  [Bot] Asking user for: ${fieldNeeded}`);
+            await chat.sendMessage(`${mentionText} ${questionToAsk}`, { mentions });
+
+            // Store pending request to continue when user responds
+            if (!this.pendingInfoRequests) {
+              this.pendingInfoRequests = new Map();
+            }
+            this.pendingInfoRequests.set(senderId, {
+              ...request,
+              awaitingField: fieldNeeded,
+              awaitingQuestion: questionToAsk,
+              originalError: error
+            });
+            // Don't clean up photo - might need it
+            return;
+          }
+
+          // Generic error we can't recover from
+          await chat.sendMessage(`${mentionText} No pude completar la solicitud: ${error || 'error desconocido'}. ¿Podés darme más detalles?`, { mentions });
+          console.log(`  [Bot] Error: ${error}`);
+
           // Clean up photo on non-retryable error
           if (photo) {
             try { fs.unlinkSync(photo); } catch (e) {}
@@ -953,7 +1140,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         this.chatCache.set(senderId, targetChat);
 
         // Use Claude to check for actionable requests
-        const extraction = await this.extractRequests(pending);
+        const extraction = await this.extractRequests(pending, senderId);
 
         if (extraction.requests && extraction.requests.length > 0) {
           for (const req of extraction.requests) {
@@ -984,6 +1171,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
               address: req.address,
               reportType: req.reportType || 'recoleccion',
               containerType: req.containerType || 'negro',
+              schedule: req.schedule || null,
               photo,
               chat: targetChat
             });

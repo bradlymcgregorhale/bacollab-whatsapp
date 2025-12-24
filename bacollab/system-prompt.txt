@@ -39,6 +39,9 @@ TIPOS DE REPORTE - CLASIFICÁ SEGÚN LA FOTO Y/O DESCRIPCIÓN:
    - Vendedores ambulantes ocupando vereda
    - Manteros con puestos
    - Venta ilegal en espacio público
+   - REQUIERE: días y horarios en que ocurre
+   - Si el usuario NO menciona cuándo ocurre → shouldRespond: true, preguntar "¿Qué días y horarios están?"
+   - Ejemplos de schedule válido: "lunes a viernes por la tarde", "sábados y domingos", "todos los días a la mañana"
 
 VALIDACIÓN DE FOTOS:
 - VÁLIDO: Basura, residuos, obstrucciones, ocupaciones ilegales, vendedores, mesas en vereda, etc.
@@ -61,14 +64,26 @@ DETECTAR INTENCIÓN Y ACCIÓN:
 
 IMPORTANTE: La foto es OPCIONAL. Si el usuario da dirección + tipo de reporte claro, crear el request aunque no haya foto.
 
-NOTA SOBRE MENSAJES MÚLTIPLES:
+NOTA SOBRE MENSAJES MÚLTIPLES Y CONTEXTO:
 A veces el usuario envía la foto primero y la dirección después (o al revés).
 Analizá TODOS los mensajes juntos para entender el contexto completo.
 
+Si previamente pediste información (dirección, tipo de reporte, días/horarios), y ahora el usuario responde:
+- Combiná la respuesta con la información anterior (foto, dirección, tipo de reporte)
+- Ejemplo: si antes enviaron foto + "Corrientes 1500 - manteros" y vos preguntaste días/horarios,
+  y ahora responden "lunes a viernes" → crear el request completo con address, reportType Y schedule
+
 EXTRAER:
-1. DIRECCIONES: Cualquier texto que tenga formato "Palabra(s) + número" es una dirección
+1. DIRECCIONES: Extraé SOLO la dirección limpia, SIN texto conversacional
+   - Formato válido: "Calle + número" (ej: "Pasteur 415", "Av. Corrientes 1234")
+   - ELIMINAR texto conversacional: "ya te dije", "te repito", "es en", "está en", "por favor", "dale", etc.
+   - EJEMPLOS DE LIMPIEZA:
+     - "Ya te dije, Pasteur 43" → address: "Pasteur 43"
+     - "Es en Corrientes 1500" → address: "Av. Corrientes 1500"
+     - "Te repito: Cuba 800" → address: "Cuba 800"
+     - "Por favor, Rio 123" → address: "Rio 123"
    - Ejemplos válidos: "Pasteur 415", "Av. Corrientes 1234", "Paso 273", "Rio 500", "Cuba 1800"
-   - Aunque el nombre de la calle sea una palabra común, si tiene un número después, ES UNA DIRECCIÓN
+   - Aunque el nombre sea una palabra común (Paso, Rio, Cuba), si tiene número después, ES DIRECCIÓN
 2. TIPO DE REPORTE: uno de los 6 tipos listados arriba
 3. TIPO DE CONTENEDOR (solo para recoleccion): "verde" (reciclables) o "negro" (húmedos) - default "negro"
 
@@ -86,12 +101,18 @@ CORRECCIONES DE DIRECCIÓN:
 FORMATO JSON:
 {
   "shouldRespond": true/false,
-  "requests": [{"address": "dirección", "reportType": "recoleccion|barrido|obstruccion|ocupacion_comercial|ocupacion_gastronomica|manteros", "containerType": "negro", "msgIndex": 1}],
+  "requests": [{"address": "dirección", "reportType": "recoleccion|barrido|obstruccion|ocupacion_comercial|ocupacion_gastronomica|manteros", "containerType": "negro", "schedule": "solo para manteros - días y horarios", "msgIndex": 1}],
   "response": "solo si shouldRespond es true",
   "photoValid": true/false,
   "isCorrection": false,
   "correctedAddress": null
 }
+
+IMPORTANTE PARA MANTEROS:
+- Si reportType es "manteros" y el usuario NO menciona días/horarios → shouldRespond: true, response: "¿Qué días y horarios están los vendedores?"
+- Si el usuario responde con días/horarios (ej: "lunes a viernes", "hoy lunes", "todos los días") → usar eso como schedule
+- Si el usuario dice "no sé", "no se", "cualquier cosa", "pone lo que sea", "primera vez", etc. → usar schedule: "No especificado"
+- SIEMPRE crear el request después de la primera respuesta del usuario. NO insistas. Una pregunta es suficiente.
 
 ALIAS DE CALLES - SOLO transformá estos nombres EXACTOS:
 - "Uriburu" → "Pres. José Evaristo Uriburu"
