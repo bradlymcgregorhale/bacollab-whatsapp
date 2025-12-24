@@ -271,7 +271,7 @@ async function analyzeAndFillForm(page, availableData) {
     // What's in this accordion?
     const textarea = questionnaireAccordion.querySelector('textarea');
     const radioInputs = questionnaireAccordion.querySelectorAll('input[type="radio"]');
-    const labels = Array.from(questionnaireAccordion.querySelectorAll('label')).map(l => l.textContent.trim());
+    const allLabels = Array.from(questionnaireAccordion.querySelectorAll('label')).map(l => l.textContent.trim());
     const buttons = questionnaireAccordion.querySelectorAll('button');
 
     // Is there an enabled Siguiente button?
@@ -288,12 +288,28 @@ async function analyzeAndFillForm(page, availableData) {
     // What's the question being asked?
     const questionLabel = questionnaireAccordion.querySelector('label')?.textContent?.trim() || '';
 
+    // Check if this is a container type question
+    const isContainerTypeQuestion = questionLabel.toLowerCase().includes('tipo de contenedor') ||
+                                     questionLabel.toLowerCase().includes('qué tipo') ||
+                                     allLabels.some(l => l.toLowerCase().includes('reciclables') || l.toLowerCase().includes('húmedos'));
+
+    // Get all radio label texts for container type selection
+    const radioLabelTexts = allLabels.filter(l =>
+      l.toLowerCase().includes('verde') ||
+      l.toLowerCase().includes('negro') ||
+      l.toLowerCase().includes('gris') ||
+      l.toLowerCase().includes('reciclables') ||
+      l.toLowerCase().includes('húmedos')
+    );
+
     return {
       hasTextarea: !!textarea,
       textareaValue: textarea?.value || '',
       textareaEmpty: textarea && (!textarea.value || textarea.value.length < 3),
       hasRadio: radioInputs.length > 0,
-      radioLabels: labels.filter(l => l === 'Sí' || l === 'No'),
+      radioLabels: allLabels.filter(l => l === 'Sí' || l === 'No'),
+      radioLabelTexts, // All container type related labels
+      isContainerTypeQuestion,
       radioSelected: !!questionnaireAccordion.querySelector('input[type="radio"]:checked'),
       questionLabel,
       hasSiguiente: !!siguienteBtn,
@@ -311,6 +327,19 @@ async function analyzeAndFillForm(page, availableData) {
 
   // THINK: What needs to be done based on what we see?
 
+  // Case 0: Container type question - select based on containerType parameter
+  if (formContext.isContainerTypeQuestion && formContext.hasRadio && !formContext.radioSelected) {
+    console.log(`[Form AI] DECISION: Container type question detected, selecting "${containerType}"`);
+    // Map containerType to the correct label text
+    const isVerde = containerType === 'verde';
+    const targetLabel = isVerde ? 'reciclables' : 'húmedos'; // Match partial text
+    return {
+      action: 'click_radio_by_text',
+      value: targetLabel,
+      then: 'click_siguiente'
+    };
+  }
+
   // Case 1: There's an empty textarea asking for days/hours
   if (formContext.hasTextarea && formContext.textareaEmpty) {
     console.log('[Form AI] DECISION: Fill textarea with schedule');
@@ -322,7 +351,7 @@ async function analyzeAndFillForm(page, availableData) {
   }
 
   // Case 2: There are radio buttons (Sí/No) and none selected - likely "¿Querés sumar información?"
-  if (formContext.hasRadio && !formContext.radioSelected) {
+  if (formContext.hasRadio && !formContext.radioSelected && formContext.radioLabels.length > 0) {
     // THINK: Is this asking if we want to add more info?
     const isAskingForMore = formContext.questionLabel.toLowerCase().includes('sumar') ||
                             formContext.questionLabel.toLowerCase().includes('adicional') ||
@@ -358,6 +387,11 @@ async function analyzeAndFillForm(page, availableData) {
       return { action: 'fill_textarea', value: schedule || 'No especificado', then: 'wait' };
     }
     if (formContext.hasRadio && !formContext.radioSelected) {
+      // If it's container type, select based on containerType
+      if (formContext.isContainerTypeQuestion) {
+        const isVerde = containerType === 'verde';
+        return { action: 'click_radio_by_text', value: isVerde ? 'reciclables' : 'húmedos', then: 'wait' };
+      }
       return { action: 'click_radio', value: 'No', then: 'wait' };
     }
   }
@@ -400,6 +434,48 @@ async function executeFormAction(page, action) {
       return false;
     }, action.value);
     console.log('[Form Execute] Clicked radio:', action.value);
+  }
+
+  // Handle click_radio_by_text - for container type and other radio selections
+  if (action.action === 'click_radio_by_text') {
+    const clicked = await page.evaluate((targetText) => {
+      // Try multiple selectors for radio labels
+      const selectors = [
+        '#collapseCuestionario.show label.form-radio-label',
+        '#collapseCuestionario.show .form-radio label',
+        '#collapseCuestionario.show label[for^="respuesta"]',
+        '#collapseCuestionario.show label'
+      ];
+
+      for (const selector of selectors) {
+        const labels = document.querySelectorAll(selector);
+        for (const label of labels) {
+          const text = label.textContent.trim().toLowerCase();
+          if (text.includes(targetText.toLowerCase())) {
+            // Click the label
+            label.click();
+            // Also try clicking the associated radio input directly
+            const radioId = label.getAttribute('for');
+            if (radioId) {
+              const radio = document.getElementById(radioId);
+              if (radio) {
+                radio.click();
+                radio.checked = true;
+                radio.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }
+            return { success: true, text: label.textContent.trim() };
+          }
+        }
+      }
+      return { success: false };
+    }, action.value);
+
+    if (clicked.success) {
+      console.log('[Form Execute] Clicked radio by text:', clicked.text);
+    } else {
+      console.log('[Form Execute] Could not find radio with text:', action.value);
+    }
   }
 
   // Wait for Angular to update
@@ -1725,19 +1801,65 @@ Respondé SOLO con JSON:
 
           if (instruction.action === 'fill' && instruction.field) {
             console.log(`[Final Step] Claude Vision says fill: "${instruction.field}" with "${instruction.value}"`);
-            // Try to fill the field
-            await page.evaluate((fieldName, value) => {
-              const inputs = document.querySelectorAll('input, textarea');
-              for (const input of inputs) {
-                const label = input.closest('div')?.querySelector('label')?.textContent || '';
-                if (label.toLowerCase().includes(fieldName.toLowerCase()) || input.placeholder?.toLowerCase().includes(fieldName.toLowerCase())) {
-                  input.value = value;
-                  input.dispatchEvent(new Event('input', { bubbles: true }));
-                  return true;
+
+            // Check if this is a radio button fill (field contains "radio" or value matches a radio label)
+            const isRadioFill = instruction.field.toLowerCase().includes('radio') ||
+                                instruction.value.toLowerCase().includes('contenedor') ||
+                                instruction.value.toLowerCase().includes('reciclables') ||
+                                instruction.value.toLowerCase().includes('húmedos') ||
+                                instruction.value.toLowerCase().includes('verde') ||
+                                instruction.value.toLowerCase().includes('negro');
+
+            if (isRadioFill) {
+              // Handle radio button selection
+              const radioClicked = await page.evaluate((value) => {
+                // Find radio labels that match the value
+                const labels = document.querySelectorAll('label.form-radio-label, .form-radio label, label[for^="respuesta"]');
+                for (const label of labels) {
+                  const text = label.textContent.trim().toLowerCase();
+                  if (text.includes(value.toLowerCase()) ||
+                      (value.toLowerCase().includes('verde') && text.includes('reciclables')) ||
+                      (value.toLowerCase().includes('negro') && text.includes('húmedos')) ||
+                      (value.toLowerCase().includes('reciclables') && text.includes('reciclables')) ||
+                      (value.toLowerCase().includes('húmedos') && text.includes('húmedos'))) {
+                    // Click the label
+                    label.click();
+                    // Also click the radio input directly
+                    const radioId = label.getAttribute('for');
+                    if (radioId) {
+                      const radio = document.getElementById(radioId);
+                      if (radio) {
+                        radio.click();
+                        radio.checked = true;
+                        radio.dispatchEvent(new Event('change', { bubbles: true }));
+                      }
+                    }
+                    return { success: true, text: label.textContent.trim() };
+                  }
                 }
+                return { success: false };
+              }, instruction.value);
+
+              if (radioClicked.success) {
+                console.log(`[Final Step] Selected radio: ${radioClicked.text}`);
+              } else {
+                console.log(`[Final Step] Could not find radio matching: ${instruction.value}`);
               }
-              return false;
-            }, instruction.field, instruction.value);
+            } else {
+              // Handle text input fill
+              await page.evaluate((fieldName, value) => {
+                const inputs = document.querySelectorAll('input:not([type="radio"]), textarea');
+                for (const input of inputs) {
+                  const label = input.closest('div')?.querySelector('label')?.textContent || '';
+                  if (label.toLowerCase().includes(fieldName.toLowerCase()) || input.placeholder?.toLowerCase().includes(fieldName.toLowerCase())) {
+                    input.value = value;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    return true;
+                  }
+                }
+                return false;
+              }, instruction.field, instruction.value);
+            }
             await delay(1000);
             continue;
           }
