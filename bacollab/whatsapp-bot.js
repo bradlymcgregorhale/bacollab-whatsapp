@@ -716,7 +716,7 @@ class TrashReportBot {
     }
   }
 
-  async extractRequests(pending, senderId) {
+  async extractRequests(pending, senderId, includeBotContext = false) {
       // IMPORTANT: Balance between not re-processing old messages and maintaining context
       // - If we asked a question (photo without address, etc.), include recent history for context
       // - If this is a fresh interaction, only process new messages
@@ -752,6 +752,14 @@ class TrashReportBot {
         console.log(`  [Context] Processing ${messagesToProcess.length} NEW message(s) from ${senderId?.split('@')[0] || 'unknown'}`);
       }
 
+      // Build bot context if provided (for startup recovery)
+      let botContextText = '';
+      if (includeBotContext && pending.botContext && pending.botContext.length > 0) {
+        botContextText = '\nMENSAJES ANTERIORES DEL BOT (ya preguntaste esto, NO repitas):\n' +
+          pending.botContext.map(b => `- Bot: ${b.text}`).join('\n') + '\n';
+        console.log(`  [Context] Including ${pending.botContext.length} bot message(s) as context`);
+      }
+
       // Build message list with text and photo indicators
       const messagesWithPhotos = messagesToProcess.map((m, i) => {
         let desc = '';
@@ -763,12 +771,12 @@ class TrashReportBot {
       const photos = messagesToProcess.filter(m => m.photo).map(m => m.photo);
       const hasPhotos = photos.length > 0;
 
-      const prompt = `MENSAJES DE ${pending.senderName}:
+      const prompt = `${botContextText}MENSAJES DE ${pending.senderName}:
 ${messagesWithPhotos}
 
 ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto corresponde al mensaje marcado con [+FOTO]]` : '[No envió fotos]'}
 
-¿Hay algo actionable? Recordá que DEBE verse un contenedor de CABA en la foto para ser válido.`;
+¿Hay algo actionable? Recordá que DEBE verse un contenedor de CABA en la foto para ser válido.${botContextText ? '\n\nIMPORTANTE: Si ya preguntaste algo arriba, NO vuelvas a preguntar lo mismo.' : ''}`;
 
       // Build message content with images if available
       const content = [];
@@ -1390,30 +1398,28 @@ Respondé SOLO con la dirección limpia, nada más.`,
       const processedAddresses = this.getProcessedSolicitudes();
       console.log(`[Startup] ${processedAddresses.size} direcciones ya procesadas en CSV`);
 
-      // Group messages by sender for processing
-      const messagesBySender = new Map();
+      // Build conversation timeline including bot's own messages
+      // This allows Claude to see the full context of what was already said
+      const conversationTimeline = [];
 
       for (const msg of messages) {
-        // Skip bot's own messages
-        if (msg.fromMe) continue;
-
         // Skip old messages (older than 2 hours)
         const msgAge = Date.now() - msg.timestamp * 1000;
         if (msgAge > MESSAGE_RETENTION_MS) continue;
 
-        const senderId = msg.author || msg.from;
-        if (!messagesBySender.has(senderId)) {
-          messagesBySender.set(senderId, []);
-        }
+        const msgTime = msg.timestamp * 1000;
+        const senderId = msg.fromMe ? 'BOT' : (msg.author || msg.from);
 
         const messageObj = {
           text: msg.body || null,
           photo: null,
-          timestamp: new Date(msg.timestamp * 1000)
+          timestamp: new Date(msgTime),
+          isBot: msg.fromMe,
+          senderId
         };
 
-        // Download photo if present
-        if (msg.hasMedia) {
+        // Download photo if present (only for user messages)
+        if (!msg.fromMe && msg.hasMedia) {
           try {
             const media = await msg.downloadMedia();
             if (media && media.mimetype.startsWith('image/')) {
@@ -1425,18 +1431,60 @@ Respondé SOLO con la dirección limpia, nada más.`,
           }
         }
 
-        messagesBySender.get(senderId).push(messageObj);
+        conversationTimeline.push(messageObj);
+      }
+
+      // Sort by timestamp
+      conversationTimeline.sort((a, b) => a.timestamp - b.timestamp);
+
+      // Group user messages, but include bot messages in context
+      const messagesBySender = new Map();
+      const botMessages = conversationTimeline.filter(m => m.isBot);
+
+      for (const msg of conversationTimeline) {
+        if (msg.isBot) continue;
+
+        const senderId = msg.senderId;
+        if (!messagesBySender.has(senderId)) {
+          messagesBySender.set(senderId, { messages: [], botContext: [] });
+        }
+
+        const userData = messagesBySender.get(senderId);
+        userData.messages.push(msg);
+
+        // Add any bot messages that came before this user message as context
+        const relevantBotMsgs = botMessages.filter(b =>
+          b.timestamp < msg.timestamp &&
+          b.timestamp > new Date(msg.timestamp.getTime() - 10 * 60 * 1000) // Within 10 min before
+        );
+        for (const botMsg of relevantBotMsgs) {
+          if (!userData.botContext.find(b => b.text === botMsg.text)) {
+            userData.botContext.push(botMsg);
+          }
+        }
       }
 
       console.log(`[Startup] ${messagesBySender.size} usuarios con mensajes recientes`);
 
       // Process each user's messages to find unprocessed requests
-      for (const [senderId, userMessages] of messagesBySender) {
-        if (userMessages.length === 0) continue;
+      for (const [senderId, userData] of messagesBySender) {
+        if (userData.messages.length === 0) continue;
 
         const senderName = 'Vecino'; // Will be resolved later
+
+        // Check if bot's last message to this user was a question waiting for response
+        const lastBotMsg = userData.botContext[userData.botContext.length - 1];
+        const lastUserMsg = userData.messages[userData.messages.length - 1];
+
+        if (lastBotMsg && lastUserMsg && lastBotMsg.timestamp > lastUserMsg.timestamp) {
+          // Bot asked after user's last message - we're waiting for response, skip
+          console.log(`[Startup] Skipping ${senderId.split('@')[0]} - already asked: "${lastBotMsg.text?.substring(0, 40)}..."`);
+          continue;
+        }
+
         const pending = {
-          messages: userMessages,
+          messages: userData.messages,
+          botContext: userData.botContext, // Include bot's previous messages
           senderName,
           chatId: targetChat.id._serialized
         };
@@ -1445,7 +1493,7 @@ Respondé SOLO con la dirección limpia, nada más.`,
         this.chatCache.set(senderId, targetChat);
 
         // Use Claude to check for actionable requests
-        const extraction = await this.extractRequests(pending, senderId);
+        const extraction = await this.extractRequests(pending, senderId, true); // true = include bot context
 
         // Send response message if Claude wants to ask something
         if (extraction.shouldRespond && extraction.response) {
@@ -1476,10 +1524,10 @@ Respondé SOLO con la dirección limpia, nada más.`,
 
             // Find matching photo
             let photo = null;
-            if (req.msgIndex && userMessages[req.msgIndex - 1]?.photo) {
-              photo = userMessages[req.msgIndex - 1].photo;
+            if (req.msgIndex && userData.messages[req.msgIndex - 1]?.photo) {
+              photo = userData.messages[req.msgIndex - 1].photo;
             } else {
-              photo = [...userMessages].reverse().find(m => m.photo)?.photo || null;
+              photo = [...userData.messages].reverse().find(m => m.photo)?.photo || null;
             }
 
             console.log(`[Startup] Encontrado pendiente: ${req.address}`);
