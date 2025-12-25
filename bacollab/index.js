@@ -723,10 +723,25 @@ async function submitSolicitud(data) {
   }
 
   // Wait for Angular app to load and the autocomplete component to be ready
+  console.log('Waiting for page to fully load...');
+
+  // First, wait for any loading spinner to disappear
+  try {
+    await page.waitForFunction(() => {
+      const spinners = document.querySelectorAll('.spinner, .loading, [class*="spinner"], [class*="loading"]');
+      return spinners.length === 0 || Array.from(spinners).every(s => !s.offsetParent);
+    }, { timeout: 30000 });
+    console.log('No loading spinners detected');
+  } catch (e) {
+    console.log('Timeout waiting for loading spinner, continuing anyway...');
+  }
+
+  await delay(2000); // Extra delay for Angular to finish loading
+
   console.log('Waiting for address input to appear...');
   try {
     await page.waitForSelector('ng-autocomplete input, input[placeholder*="Lugar"], input[role="combobox"]', {
-      timeout: 15000,
+      timeout: 30000, // Increased from 15s to 30s
       visible: true
     });
     console.log('Address input selector found');
@@ -734,7 +749,7 @@ async function submitSolicitud(data) {
     console.log('Timeout waiting for address input selector');
   }
 
-  await delay(1000); // Brief delay for Angular to finish binding
+  await delay(1500); // Brief delay for Angular to finish binding
 
   // Debug: Take screenshot and log all input elements
   await page.screenshot({ path: 'debug-before-address-input.png', fullPage: true });
@@ -2574,10 +2589,17 @@ app.post('/solicitud', async (req, res) => {
       await closeBrowser();
 
       // Only retry for specific errors that might be fixed by a fresh session
-      if (attempt < maxAttempts && error.message.includes('No address suggestions found')) {
+      const isAddressError = error.message.includes('No address suggestions found') ||
+                             error.message.includes('Address input not found');
+
+      if (attempt < maxAttempts && isAddressError) {
         console.log('Retrying with fresh browser session...');
-        await new Promise(r => setTimeout(r, 2000)); // Brief delay before retry
+        await new Promise(r => setTimeout(r, 3000)); // Longer delay before retry
       } else {
+        // Improve error message for address-related errors
+        if (isAddressError) {
+          lastError = new Error(`No pudimos encontrar la dirección "${address}". Verificá que esté bien escrita y volvé a intentar.`);
+        }
         break;
       }
     }
