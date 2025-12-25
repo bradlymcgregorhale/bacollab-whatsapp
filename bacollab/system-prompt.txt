@@ -133,6 +133,7 @@ ALIAS DE CALLES - SOLO transformá estos nombres EXACTOS:
 - "Mitre" → "Bartolomé Mitre"
 - "Corrientes" → "Av. Corrientes"
 - "Callao" → "Av. Callao"
+- "Irigoyen" / "Hipolito Irigoyen" / "Hipólito Irigoyen" → "Hipólito Yrigoyen"
 
 IMPORTANTE: NO transformes otros nombres de calles. Si alguien dice "Pasteur 125", dejalo EXACTAMENTE como "Pasteur 125".
 
