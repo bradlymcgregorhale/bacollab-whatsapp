@@ -46,13 +46,19 @@ TIPOS DE REPORTE - CLASIFICÁ PRIMERO POR LA FOTO, DESPUÉS POR EL TEXTO:
    - Decks gastronómicos
    - Áreas de comida invadiendo espacio público
 
-6. reportType: "manteros" (código: 1334597891562) - Ocupación por manteros/vendedores ambulantes:
-   - Vendedores ambulantes ocupando vereda
-   - Manteros con puestos
-   - Venta ilegal en espacio público
+6. reportType: "manteros" (código: 1334597891562) - Ocupación por vendedores ambulantes/manteros:
+   - Vendedores ambulantes ocupando vereda (NO fijos, se mueven)
+   - Manteros con puestos improvisados/lonas en el piso
+   - Venta ilegal en espacio público SIN local fijo
    - REQUIERE: días y horarios en que ocurre
-   - Si el usuario NO menciona cuándo ocurre → shouldRespond: true, preguntar "¿Qué días y horarios están?"
+   - Si el usuario NO menciona cuándo ocurre → shouldRespond: true, preguntar "¿Qué días y horarios están los vendedores ambulantes?"
    - Ejemplos de schedule válido: "lunes a viernes por la tarde", "sábados y domingos", "todos los días a la mañana"
+
+⚠️ CUIDADO: NO confundas manteros con ocupacion_comercial:
+   - Si hay un LOCAL/NEGOCIO/KIOSCO visible → es ocupacion_comercial, NO manteros
+   - Si hay objetos de un COMERCIO FIJO (heladera, estantes, mercadería de tienda) → ocupacion_comercial
+   - Manteros son vendedores SIN local fijo (lonas en el piso, carritos ambulantes)
+   - Si no estás seguro, preguntá: "¿Es por un local comercial que ocupa la vereda, o por vendedores ambulantes?"
 
 VALIDACIÓN DE FOTOS:
 - VÁLIDO: Basura, residuos, calles sucias, veredas, obstrucciones, ocupaciones ilegales, vendedores, mesas en vereda

@@ -943,15 +943,18 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
   async extractReportType(rawText) {
     try {
       const response = await anthropic.messages.create({
-        model: 'claude-haiku-4-20250514',
+        model: 'claude-3-5-haiku-20241022',
         max_tokens: 50,
         system: `Clasificá la respuesta del usuario en UNO de estos tipos de reporte:
 - recoleccion: basura, residuos, contenedor desbordando, bolsas en la vereda
 - barrido: calle sucia, mugre, tierra, hojas, necesita barrer
 - obstruccion: algo bloqueando la vereda o calle, caños, fierros
-- ocupacion_comercial: local/negocio/kiosco/comercio poniendo cosas en la vereda
+- ocupacion_comercial: local/negocio/kiosco/comercio poniendo cosas en la vereda, ocupación indebida
 - ocupacion_gastronomica: restaurant/bar/café con mesas en la vereda
 - manteros: vendedores ambulantes, manteros, venta ilegal en la calle
+
+IMPORTANTE: Si el usuario dice "NO es X" o "no manteros", entonces NO es ese tipo.
+Si dice "local" u "ocupación indebida" → ocupacion_comercial
 
 Respondé SOLO con una de estas palabras: recoleccion, barrido, obstruccion, ocupacion_comercial, ocupacion_gastronomica, manteros`,
         messages: [{ role: 'user', content: rawText }]
@@ -978,7 +981,7 @@ Respondé SOLO con una de estas palabras: recoleccion, barrido, obstruccion, ocu
   async extractCleanAddress(rawText) {
     try {
       const response = await anthropic.messages.create({
-        model: 'claude-haiku-4-20250514',
+        model: 'claude-3-5-haiku-20241022',
         max_tokens: 100,
         system: `Extraé SOLO la dirección (calle + número) del texto del usuario.
 Eliminá texto conversacional como "es", "no", "al", "quise decir", "perdón", etc.
