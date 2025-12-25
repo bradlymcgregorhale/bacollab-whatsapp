@@ -409,6 +409,53 @@ class TrashReportBot {
         console.log(`[Pending Info] Resubmitting with cleaned address: "${cleanAddress}"`);
         await this.submitRequest(pendingRequest);
         return;
+      } else if (awaitingField === 'reportType' && lastMessage?.text) {
+        // Looking for report type clarification
+        console.log(`[Pending Info] User provided report type: "${lastMessage.text}"`);
+
+        // Map user response to reportType
+        const responseText = lastMessage.text.toLowerCase();
+        let reportType = 'recoleccion'; // default
+
+        if (responseText.includes('local comercial') || responseText.includes('ocupacion comercial') || responseText.includes('ocupación comercial')) {
+          reportType = 'ocupacion_comercial';
+        } else if (responseText.includes('gastronom') || responseText.includes('restaurant') || responseText.includes('bar') || responseText.includes('mesas')) {
+          reportType = 'ocupacion_gastronomica';
+        } else if (responseText.includes('mantero') || responseText.includes('vendedor') || responseText.includes('ambulante')) {
+          reportType = 'manteros';
+        } else if (responseText.includes('obstrucc') || responseText.includes('bloqueado') || responseText.includes('bloqueando')) {
+          reportType = 'obstruccion';
+        } else if (responseText.includes('barrido') || responseText.includes('barrer') || responseText.includes('mugre') || responseText.includes('suciedad')) {
+          reportType = 'barrido';
+        } else if (responseText.includes('basura') || responseText.includes('residuo') || responseText.includes('contenedor') || responseText.includes('recolec')) {
+          reportType = 'recoleccion';
+        }
+
+        pendingRequest.reportType = reportType;
+        console.log(`[Pending Info] Mapped to reportType: ${reportType}`);
+
+        this.pendingInfoRequests.delete(senderId);
+        pendingMessages.delete(senderId);
+
+        // Notify user and queue request
+        const chat = pendingRequest.chat;
+        const senderInfo = this.senderIdCache?.get(senderId);
+        const mentions = senderInfo ? [senderInfo.senderId] : [];
+        const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+
+        const reportLabels = {
+          recoleccion: 'recolección de residuos',
+          barrido: 'mejora de barrido',
+          obstruccion: 'obstrucción de vereda',
+          ocupacion_comercial: 'ocupación por local comercial',
+          ocupacion_gastronomica: 'ocupación gastronómica',
+          manteros: 'vendedores ambulantes'
+        };
+
+        await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${reportLabels[reportType]} en ${pendingRequest.address}...`.trim(), { mentions });
+        console.log(`[Pending Info] Submitting with reportType: ${reportType}`);
+        await this.submitRequest(pendingRequest);
+        return;
       } else if (lastMessage?.text) {
         // Generic text response - likely schedule or other info
         console.log(`[Pending Info] User responded: "${lastMessage.text}"`);
@@ -479,17 +526,51 @@ class TrashReportBot {
 
       // If nothing actionable and no response needed, stay quiet
       if (!extraction.requests || extraction.requests.length === 0) {
-        // Only respond if Claude says we should (e.g., asking for address)
+        // Only respond if Claude says we should (e.g., asking for address or report type)
         if (extraction.shouldRespond && extraction.response) {
           const senderInfo = this.senderIdCache?.get(senderId);
           const mentions = senderInfo ? [senderInfo.senderId] : [];
           const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
           await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions });
           console.log(`  [Bot] @${pending.senderName} ${extraction.response}`);
-          // Keep messages for follow-up - don't clear them so Claude has context
-          // when the user responds to our question
+
+          // Check if we have an address in the messages - if so, save partial request
+          // so we don't re-extract old messages when user responds
+          const hasPhotos = pending.messages.some(m => m.photo);
+          const textWithAddress = pending.messages.find(m => m.text && /\d+/.test(m.text));
+
+          if (hasPhotos && textWithAddress) {
+            // Extract address from the message text
+            const addressMatch = textWithAddress.text.match(/([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s]+)\s+(\d+)/);
+            if (addressMatch) {
+              const partialAddress = `${addressMatch[1].trim()} ${addressMatch[2]}`;
+              const photo = pending.messages.find(m => m.photo)?.photo;
+
+              console.log(`  [Partial] Saving partial request: ${partialAddress} (awaiting reportType)`);
+
+              // Save as pending info request awaiting reportType
+              if (!this.pendingInfoRequests) {
+                this.pendingInfoRequests = new Map();
+              }
+              this.pendingInfoRequests.set(senderId, {
+                senderId,
+                senderName: pending.senderName,
+                address: partialAddress,
+                photo,
+                chat,
+                awaitingField: 'reportType',
+                awaitingQuestion: extraction.response
+              });
+
+              // Clear pending messages since we saved the context
+              pendingMessages.delete(senderId);
+              return;
+            }
+          }
+
+          // No partial request to save - keep messages for follow-up
           pending.timer = null;
-          pending.askedQuestion = true; // Mark that we asked a question
+          pending.askedQuestion = true;
           return;
         }
         console.log('  [Bot] Nada actionable, ignorando');
