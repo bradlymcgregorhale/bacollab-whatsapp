@@ -1286,6 +1286,19 @@ Respondé SOLO con la dirección limpia, nada más.`,
         // Use Claude to check for actionable requests
         const extraction = await this.extractRequests(pending, senderId);
 
+        // Send response message if Claude wants to ask something
+        if (extraction.shouldRespond && extraction.response) {
+          try {
+            // Get sender info for mention
+            const senderPhone = senderId.split('@')[0];
+            const mentionText = `@${senderPhone}`;
+            await targetChat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions: [senderId] });
+            console.log(`[Startup] Sent message to ${senderPhone}: ${extraction.response}`);
+          } catch (e) {
+            console.log(`[Startup] Error sending message: ${e.message}`);
+          }
+        }
+
         if (extraction.requests && extraction.requests.length > 0) {
           for (const req of extraction.requests) {
             // Skip if no address

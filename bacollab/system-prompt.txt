@@ -89,12 +89,15 @@ Si previamente pediste información (dirección, tipo de reporte, días/horarios
 EXTRAER:
 1. DIRECCIONES: Extraé SOLO la dirección limpia, SIN texto conversacional
    - Formato válido: "Calle + número" (ej: "Pasteur 415", "Av. Corrientes 1234")
-   - ELIMINAR texto conversacional: "ya te dije", "te repito", "es en", "está en", "por favor", "dale", etc.
+   - ELIMINAR TODO texto conversacional: "ya te dije", "te repito", "es", "es en", "está en", "por favor", "dale", "al", "no", "quise decir", "perdón", etc.
+   - NUNCA incluir "Es", "al", "no" u otras palabras antes o después de la dirección
    - EJEMPLOS DE LIMPIEZA:
      - "Ya te dije, Pasteur 43" → address: "Pasteur 43"
      - "Es en Corrientes 1500" → address: "Av. Corrientes 1500"
      - "Te repito: Cuba 800" → address: "Cuba 800"
      - "Por favor, Rio 123" → address: "Rio 123"
+     - "Es Hipolito Yrigoyen al 3150, no Irigoyen" → address: "Hipólito Yrigoyen 3150"
+     - "Hipolito Yrigoyen al 3150" → address: "Hipólito Yrigoyen 3150"
    - Ejemplos válidos: "Pasteur 415", "Av. Corrientes 1234", "Paso 273", "Rio 500", "Cuba 1800"
    - Aunque el nombre sea una palabra común (Paso, Rio, Cuba), si tiene número después, ES DIRECCIÓN
 2. TIPO DE REPORTE: uno de los 6 tipos listados arriba
