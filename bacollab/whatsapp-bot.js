@@ -65,6 +65,11 @@ const anthropic = new Anthropic({
 const requestQueue = [];
 let isProcessingQueue = false;
 
+// In-memory tracker to prevent duplicate submissions within same session
+// Key: address (lowercase), Value: timestamp when queued/submitted
+const recentlyQueuedAddresses = new Map();
+const QUEUE_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
 // Pending messages buffer - collects messages before processing
 // Key: senderId, Value: { messages: [], timer: null, senderName: string }
 // messages format: { text: string|null, photo: string|null, timestamp: Date }
@@ -547,7 +552,16 @@ class TrashReportBot {
           await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${descriptionText}...`.trim(), { mentions });
           console.log(`  [Bot] Procesando: ${descriptionText}`);
 
+          let queuedCount = 0;
           for (const req of newRequests) {
+            // In-memory dedup: skip if this address was queued recently
+            const addrKey = req.address.toLowerCase();
+            const recentlyQueued = recentlyQueuedAddresses.get(addrKey);
+            if (recentlyQueued && (Date.now() - recentlyQueued) < QUEUE_DEDUP_WINDOW_MS) {
+              console.log(`  [Dedup] Skipping ${req.address} - queued ${Math.round((Date.now() - recentlyQueued) / 1000)}s ago`);
+              continue;
+            }
+
             let photo = null;
             // Use msgIndex if provided (1-indexed)
             if (req.msgIndex && pending.messages[req.msgIndex - 1]?.photo) {
@@ -560,6 +574,9 @@ class TrashReportBot {
               photo = matchingMsg?.photo || [...pending.messages].reverse().find(m => m.photo)?.photo || null;
             }
 
+            // Mark as queued
+            recentlyQueuedAddresses.set(addrKey, Date.now());
+
             requestQueue.push({
               senderId,
               senderName: pending.senderName,
@@ -570,9 +587,14 @@ class TrashReportBot {
               photo,
               chat
             });
+            queuedCount++;
           }
 
-          console.log(`  Queued ${newRequests.length} request(s)`);
+          if (queuedCount > 0) {
+            console.log(`  Queued ${queuedCount} request(s)`);
+          } else {
+            console.log(`  All requests were duplicates, nothing queued`);
+          }
         }
 
         // Log request details
@@ -598,16 +620,40 @@ class TrashReportBot {
   }
 
   async extractRequests(pending, senderId) {
-      // Always use the user's last 10 messages for context (stored by phone number/senderId)
-      // This ensures Claude has full conversation history when user responds to questions
+      // IMPORTANT: Balance between not re-processing old messages and maintaining context
+      // - If we asked a question (photo without address, etc.), include recent history for context
+      // - If this is a fresh interaction, only process new messages
+
+      const hasPendingInfoRequest = this.pendingInfoRequests?.has(senderId);
+      const askedQuestionRecently = pending.askedQuestion === true;
+
+      // Check if there are photos in history that might be relevant
       const userHistory = senderId ? (userMessageHistory.get(senderId) || []) : [];
+      const recentPhotos = userHistory.slice(-5).filter(m => m.photo);
+      const newMessagesHaveNoPhotos = !pending.messages.some(m => m.photo);
+      const needsPhotoContext = recentPhotos.length > 0 && newMessagesHaveNoPhotos;
 
-      // Use history if available, otherwise fall back to pending messages (for startup checks)
-      const messagesToProcess = userHistory.length > 0
-        ? userHistory.slice(-10)  // Last 10 messages from this user
-        : pending.messages;
+      let messagesToProcess;
+      if (hasPendingInfoRequest || askedQuestionRecently || needsPhotoContext) {
+        // Use recent history for context when:
+        // 1. We're waiting for info (retry flow)
+        // 2. We asked a question like "What address?"
+        // 3. User sends text but recent history has photos (likely responding to photo)
+        messagesToProcess = userHistory.slice(-5); // Last 5 for context
+        const reason = hasPendingInfoRequest ? 'pending info request'
+                     : askedQuestionRecently ? 'asked question recently'
+                     : 'photo in recent history';
+        console.log(`  [Context] Using history (${reason}) - ${messagesToProcess.length} messages`);
 
-      console.log(`  [Context] User ${senderId?.split('@')[0] || 'unknown'}: ${messagesToProcess.length} messages`);
+        // Clear the askedQuestion flag now that we're processing the follow-up
+        if (askedQuestionRecently) {
+          pending.askedQuestion = false;
+        }
+      } else {
+        // Normal mode: ONLY process the NEW pending messages
+        messagesToProcess = pending.messages;
+        console.log(`  [Context] Processing ${messagesToProcess.length} NEW message(s) from ${senderId?.split('@')[0] || 'unknown'}`);
+      }
 
       // Build message list with text and photo indicators
       const messagesWithPhotos = messagesToProcess.map((m, i) => {
