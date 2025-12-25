@@ -834,6 +834,15 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     isProcessingQueue = false;
   }
 
+  // Helper to remove address from dedup map (allows manual retry after failure)
+  clearFromDedup(address) {
+    const addrKey = address.toLowerCase();
+    if (recentlyQueuedAddresses.has(addrKey)) {
+      recentlyQueuedAddresses.delete(addrKey);
+      console.log(`  [Dedup] Cleared ${address} from dedup map (allowing retry)`);
+    }
+  }
+
   async submitRequest(request, isRetry = false) {
     const { senderId, senderName, address, reportType = 'recoleccion', containerType, schedule, photo, chat } = request;
     const senderInfo = this.senderIdCache?.get(senderId);
@@ -941,6 +950,9 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
           const retryDelays = [5, 50, 500];
           const nextRetryMinutes = retryDelays[retryCount];
 
+          // Clear from dedup so user can manually retry if they want
+          this.clearFromDedup(address);
+
           if (retryCount < 3) {
             // Schedule retry and notify user
             this.scheduleRetry(request);
@@ -988,17 +1000,19 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
             canRecover = true;
           } else if (error.toLowerCase().includes('radio sin seleccionar') || error.toLowerCase().includes('opciones')) {
             // This is usually internal form issue - auto retry
+            this.clearFromDedup(address); // Allow manual retry
             this.scheduleRetry(request);
             await chat.sendMessage(
               `${mentionText} Hubo un problema con el formulario. Voy a reintentar automáticamente.`,
               { mentions }
             );
             return;
-          } else if (error.toLowerCase().includes('confirmar') || error.toLowerCase().includes('button') || error.toLowerCase().includes('atascado')) {
+          } else if (error.toLowerCase().includes('confirmar') || error.toLowerCase().includes('button') || error.toLowerCase().includes('atascado') || error.toLowerCase().includes('clickable') || error.toLowerCase().includes('element')) {
             // Form navigation error - can retry
             questionToAsk = null;
             canRecover = false;
-            // Schedule retry
+            // Clear dedup and schedule retry
+            this.clearFromDedup(address); // Allow manual retry
             this.scheduleRetry(request);
             await chat.sendMessage(
               `${mentionText} Hubo un problema técnico con el formulario. Voy a reintentar automáticamente.`,
@@ -1039,6 +1053,9 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
 
     } catch (error) {
       console.error('Error submitting solicitud:', error);
+
+      // Clear from dedup so user can manually retry if they want
+      this.clearFromDedup(address);
 
       // Network or other errors - schedule retry
       const retryCount = request.retryCount || 0;
