@@ -1185,15 +1185,73 @@ async function submitSolicitud(data) {
   console.log('Looking for main submit button...');
   await page.screenshot({ path: 'debug-before-submit.png', fullPage: true });
 
-  // Try to find and click any available submit button
+  // First, capture the HTML of the form-actions area for debugging
+  const formActionsHTML = await page.evaluate(() => {
+    // IMPORTANT: Look for the MAIN form-actions at the bottom (with mt-50 class)
+    // NOT the ones inside collapsed accordions
+    const mainFormActions = document.querySelector('.form-actions.mt-50');
+    if (mainFormActions) return mainFormActions.outerHTML;
+
+    // Fallback: find form-actions that is NOT inside a collapsed accordion
+    const allFormActions = document.querySelectorAll('.form-actions');
+    for (const fa of allFormActions) {
+      const inCollapsedAccordion = fa.closest('.accordion-collapse:not(.show)');
+      if (!inCollapsedAccordion) {
+        return fa.outerHTML;
+      }
+    }
+    return null;
+  });
+  console.log('Form-actions HTML:', formActionsHTML);
+
+  // Try to find and click any available submit button with multiple methods
   const submitResult = await page.evaluate(() => {
-    // Look for form-actions container first
-    const formActions = document.querySelector('.form-actions, .form-actions.mt-50');
+    const result = { success: false, methods: [], html: null };
+
+    // CRITICAL: Look for the MAIN form-actions at bottom (with mt-50 class) FIRST
+    // This is the one that submits the entire form, not the ones inside accordions
+    let formActions = document.querySelector('.form-actions.mt-50');
+
+    // If not found, look for form-actions that is NOT inside a collapsed accordion
+    if (!formActions) {
+      const allFormActions = document.querySelectorAll('.form-actions');
+      for (const fa of allFormActions) {
+        const inCollapsedAccordion = fa.closest('.accordion-collapse:not(.show)');
+        const inOpenAccordion = fa.closest('.accordion-collapse.show');
+        // Prefer form-actions that is NOT inside ANY accordion (main page level)
+        if (!inCollapsedAccordion && !inOpenAccordion) {
+          formActions = fa;
+          break;
+        }
+      }
+    }
+
     if (formActions) {
       const btn = formActions.querySelector('button.btn-primary:not([disabled])');
       if (btn) {
+        result.html = btn.outerHTML;
+
+        // Method 1: Standard click
         btn.click();
-        return { success: true, method: 'form-actions', text: btn.textContent.trim() };
+        result.methods.push('click');
+
+        // Method 2: Dispatch MouseEvent (works better with Angular)
+        btn.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+        result.methods.push('MouseEvent');
+
+        // Method 3: Focus and trigger
+        btn.focus();
+        btn.dispatchEvent(new Event('focus', { bubbles: true }));
+        result.methods.push('focus');
+
+        result.success = true;
+        result.method = 'form-actions';
+        result.text = btn.textContent.trim();
+        return result;
       }
     }
 
@@ -1203,15 +1261,35 @@ async function submitSolicitud(data) {
       const text = btn.textContent || '';
       const isInAccordion = btn.closest('.accordion-body');
       if (!isInAccordion && (text.includes('Siguiente') || text.includes('Confirmar'))) {
+        result.html = btn.outerHTML;
         btn.click();
-        return { success: true, method: 'fallback', text: text.trim() };
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        result.success = true;
+        result.method = 'fallback';
+        result.text = text.trim();
+        result.methods.push('click', 'MouseEvent');
+        return result;
       }
     }
 
-    return { success: false };
+    return result;
   });
 
   console.log('Submit button result:', submitResult);
+
+  // Also try Puppeteer's native click as backup
+  if (submitResult.success) {
+    console.log('Also trying Puppeteer native click...');
+    try {
+      // Use the MAIN form-actions selector (with mt-50 class)
+      const btnSelector = '.form-actions.mt-50 button.btn-primary:not([disabled])';
+      await page.waitForSelector(btnSelector, { timeout: 2000 });
+      await page.click(btnSelector);
+      console.log('Puppeteer native click successful');
+    } catch (e) {
+      console.log('Puppeteer native click skipped:', e.message);
+    }
+  }
 
   await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {
     console.log('Navigation timeout after submit');
@@ -1289,7 +1367,20 @@ async function submitSolicitud(data) {
       console.log('[Final Step] Capturing network activity during button click...');
       const networkResult = await captureNetworkDuringAction(page, async () => {
         await page.evaluate(() => {
-          const btn = document.querySelector('.form-actions button.btn-primary:not([disabled])');
+          // CRITICAL: Click the MAIN form-actions button (with mt-50), not the hidden accordion ones
+          let btn = document.querySelector('.form-actions.mt-50 button.btn-primary:not([disabled])');
+
+          // Fallback: find visible button not in accordion
+          if (!btn) {
+            const allBtns = document.querySelectorAll('.form-actions button.btn-primary:not([disabled])');
+            for (const b of allBtns) {
+              if (b.offsetParent !== null && !b.closest('.accordion-collapse')) {
+                btn = b;
+                break;
+              }
+            }
+          }
+
           if (btn) {
             btn.click();
             return true;
@@ -1315,15 +1406,50 @@ async function submitSolicitud(data) {
         console.log(`[Final Step] MISSING FIELDS: ${accordionInspection.summary.missingFields.join(', ')}`);
       }
 
-      // Now do the standard diagnostics
+      // Now do the standard diagnostics WITH full HTML capture
       const diagnostics = await page.evaluate(() => {
         const results = {
           formValidation: null,
           requiredFields: [],
           buttonState: null,
           angularErrors: [],
-          hiddenErrors: []
+          hiddenErrors: [],
+          formActionsHTML: null,
+          allButtonsHTML: [],
+          pageStructureHTML: null
         };
+
+        // CRITICAL: Capture the actual HTML of the MAIN form-actions (with mt-50)
+        // This is the submit button at the bottom, not the ones inside accordions
+        let formActionsEl = document.querySelector('.form-actions.mt-50');
+        if (!formActionsEl) {
+          // Fallback: find form-actions NOT inside an accordion
+          const allFormActions = document.querySelectorAll('.form-actions');
+          for (const fa of allFormActions) {
+            if (!fa.closest('.accordion-collapse')) {
+              formActionsEl = fa;
+              break;
+            }
+          }
+        }
+        if (formActionsEl) {
+          results.formActionsHTML = formActionsEl.outerHTML;
+        }
+
+        // Capture HTML of all visible buttons, with better detection of which is the main submit
+        const allButtons = document.querySelectorAll('button:not([disabled])');
+        results.allButtonsHTML = Array.from(allButtons).map(btn => ({
+          html: btn.outerHTML.substring(0, 200),
+          text: btn.textContent.trim(),
+          inFormActions: !!btn.closest('.form-actions'),
+          inMainFormActions: !!btn.closest('.form-actions.mt-50'),
+          inAccordion: !!btn.closest('.accordion-collapse'),
+          isVisible: btn.offsetParent !== null
+        }));
+
+        // Capture the overall page structure around form actions
+        const mainContainer = document.querySelector('app-solicitud-crear, main, .main-content') || document.body;
+        results.pageStructureHTML = mainContainer.innerHTML.substring(0, 3000);
 
         // Check Angular form validation (ng-invalid classes)
         const invalidFields = document.querySelectorAll('.ng-invalid, [aria-invalid="true"], .is-invalid');
@@ -1358,15 +1484,27 @@ async function submitSolicitud(data) {
           }
         }
 
-        // Also check main form-actions button
-        const formActions = document.querySelector('.form-actions');
-        if (formActions) {
-          const mainBtn = formActions.querySelector('button.btn-primary');
+        // Also check MAIN form-actions button (the one with mt-50, not inside accordions)
+        let mainFormActions = document.querySelector('.form-actions.mt-50');
+        if (!mainFormActions) {
+          // Fallback: find form-actions NOT inside an accordion
+          const allFormActions = document.querySelectorAll('.form-actions');
+          for (const fa of allFormActions) {
+            if (!fa.closest('.accordion-collapse')) {
+              mainFormActions = fa;
+              break;
+            }
+          }
+        }
+        if (mainFormActions) {
+          const mainBtn = mainFormActions.querySelector('button.btn-primary');
           if (mainBtn) {
             results.mainButtonState = {
               text: mainBtn.textContent.trim(),
               disabled: mainBtn.disabled,
-              classes: mainBtn.className
+              classes: mainBtn.className,
+              isVisible: mainBtn.offsetParent !== null,
+              inMainFormActions: true
             };
           }
         }
@@ -1385,6 +1523,14 @@ async function submitSolicitud(data) {
       });
 
       console.log('[Final Step] DIAGNOSTICS:', JSON.stringify(diagnostics, null, 2));
+
+      // Log the captured HTML for debugging
+      if (diagnostics.formActionsHTML) {
+        console.log('[Final Step] FORM ACTIONS HTML:', diagnostics.formActionsHTML);
+      } else {
+        console.log('[Final Step] WARNING: No .form-actions element found on page!');
+      }
+      console.log('[Final Step] ALL BUTTONS:', JSON.stringify(diagnostics.allButtonsHTML, null, 2));
 
       // If we found form validation issues, report them instead of blindly retrying
       if (diagnostics.requiredFields.length > 0) {
@@ -1468,6 +1614,12 @@ ${accordionInspection.accordions.map(a => {
 - Campos inválidos: ${diagnostics.requiredFields.length > 0 ? diagnostics.requiredFields.map(f => `${f.name}${f.value ? '=' + f.value : ' (VACÍO)'}`).join(', ') : 'ninguno'}
 - Estado del botón principal: ${diagnostics.mainButtonState ? JSON.stringify(diagnostics.mainButtonState) : 'no encontrado'}
 - Errores ocultos: ${diagnostics.hiddenErrors.length > 0 ? diagnostics.hiddenErrors.join(', ') : 'ninguno'}
+
+📄 HTML DE LOS BOTONES EN LA PÁGINA:
+${diagnostics.formActionsHTML ? `FORM-ACTIONS: ${diagnostics.formActionsHTML}` : 'NO HAY .form-actions EN LA PÁGINA'}
+
+TODOS LOS BOTONES VISIBLES:
+${diagnostics.allButtonsHTML.filter(b => b.isVisible).map(b => `- "${b.text}" ${b.inFormActions ? '(en form-actions)' : ''}: ${b.html}`).join('\n')}
 
 ANÁLISIS:
 - El botón "Siguiente" YA FUE CLICKEADO ${stuckCount} VECES y la página NO AVANZÓ
@@ -1774,26 +1926,94 @@ Respondé SOLO con JSON:
 
           if (instruction.action === 'click' && instruction.buttonText) {
             console.log(`[Final Step] Claude Vision says click: "${instruction.buttonText}" at ${instruction.location}`);
+
+            // Enhanced button clicking with multiple methods
             const clicked = await page.evaluate((btnText) => {
+              const result = { clicked: false, methods: [] };
+
+              // Method 1: Find button in MAIN form-actions first (with mt-50, not in accordion)
+              let formActions = document.querySelector('.form-actions.mt-50');
+              if (!formActions) {
+                // Fallback: find form-actions NOT inside an accordion
+                const allFormActions = document.querySelectorAll('.form-actions');
+                for (const fa of allFormActions) {
+                  if (!fa.closest('.accordion-collapse')) {
+                    formActions = fa;
+                    break;
+                  }
+                }
+              }
+              if (formActions) {
+                const formBtn = formActions.querySelector('button.btn-primary:not([disabled])');
+                if (formBtn && formBtn.textContent.trim().includes(btnText)) {
+                  // Try click()
+                  formBtn.click();
+                  result.methods.push('form-actions click');
+
+                  // Also try dispatching events
+                  formBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                  result.methods.push('form-actions dispatchEvent');
+
+                  result.clicked = true;
+                  result.text = formBtn.textContent.trim();
+                  result.html = formBtn.outerHTML.substring(0, 150);
+                  return result;
+                }
+              }
+
+              // Method 2: Search all buttons
               const buttons = document.querySelectorAll('button:not([disabled])');
               for (const btn of buttons) {
                 if (btn.textContent.trim().includes(btnText) || btn.textContent.trim() === btnText) {
                   btn.click();
-                  return { clicked: true, text: btn.textContent.trim() };
+                  btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                  result.clicked = true;
+                  result.text = btn.textContent.trim();
+                  result.methods.push('button click');
+                  return result;
                 }
               }
-              // Also try links
+
+              // Method 3: Try links
               const links = document.querySelectorAll('a');
               for (const link of links) {
                 if (link.textContent.trim().includes(btnText)) {
                   link.click();
-                  return { clicked: true, text: link.textContent.trim(), type: 'link' };
+                  result.clicked = true;
+                  result.text = link.textContent.trim();
+                  result.type = 'link';
+                  result.methods.push('link click');
+                  return result;
                 }
               }
-              return { clicked: false };
+
+              return result;
             }, instruction.buttonText);
 
             console.log(`[Final Step] Vision instruction executed:`, clicked);
+
+            // If page-based click didn't work, try Puppeteer's click
+            if (!clicked.clicked) {
+              console.log('[Final Step] Trying Puppeteer click...');
+              try {
+                // Use the MAIN form-actions selector (with mt-50)
+                const btnHandle = await page.$(`.form-actions.mt-50 button.btn-primary:not([disabled])`);
+                if (btnHandle) {
+                  await btnHandle.click();
+                  console.log('[Final Step] Puppeteer click succeeded');
+                } else {
+                  // Fallback to any visible primary button
+                  const altHandle = await page.$(`button.btn-primary:not([disabled])`);
+                  if (altHandle) {
+                    await altHandle.click();
+                    console.log('[Final Step] Puppeteer fallback click succeeded');
+                  }
+                }
+              } catch (e) {
+                console.log('[Final Step] Puppeteer click failed:', e.message);
+              }
+            }
+
             await delay(3000);
             await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
             continue;
@@ -1884,12 +2104,59 @@ Respondé SOLO con JSON:
     }
 
     // THINK: Check what page we're on and what action to take
+    // Check if we're on the confirmation page (URL contains confirmacionSolicitud)
+    const currentUrl = pageContext.url;
+    if (currentUrl.includes('confirmacionSolicitud')) {
+      console.log('[Final Step] ON CONFIRMATION PAGE - looking for Confirmar button');
+    }
+
     const confirmationCheck = await page.evaluate(() => {
       const bodyText = document.body.innerText || '';
+      const url = window.location.href;
 
-      // Are we on the REVIEW page? ("Revisá y confirmá la información de tu solicitud")
-      const isReviewPage = bodyText.includes('Revisá y confirmá') ||
-                           bodyText.includes('Confirmar') && bodyText.includes('Cancelar') && bodyText.includes('Modificar');
+      // Are we on the confirmation/review page?
+      const isConfirmationPage = url.includes('confirmacionSolicitud') ||
+                                  bodyText.includes('Revisá y confirmá') ||
+                                  (bodyText.includes('Confirmar') && bodyText.includes('Cancelar') && bodyText.includes('Modificar'));
+
+      // Look for "Confirmar" button ANYWHERE on the page (but not in modals)
+      const allButtons = document.querySelectorAll('button:not([disabled])');
+      const buttonInfo = [];
+
+      for (const btn of allButtons) {
+        const text = btn.textContent.trim();
+        const inModal = !!btn.closest('.modal, [role="dialog"]');
+        const inAccordion = !!btn.closest('.accordion-collapse');
+        const classes = btn.className;
+
+        buttonInfo.push({ text, inModal, inAccordion, classes: classes.substring(0, 50) });
+
+        // Found "Confirmar" button (not in modal, not in accordion)
+        if (text === 'Confirmar' && !inModal && !inAccordion) {
+          return {
+            hasConfirmation: true,
+            buttonText: 'Confirmar',
+            source: 'page',
+            isConfirmationPage,
+            buttonClasses: classes
+          };
+        }
+      }
+
+      // Also check for buttons inside grupo-botones (specific to confirmation page)
+      const grupoBotones = document.querySelector('.grupo-botones');
+      if (grupoBotones) {
+        const confirmBtn = grupoBotones.querySelector('button.btn-primary');
+        if (confirmBtn && confirmBtn.textContent.trim() === 'Confirmar') {
+          return {
+            hasConfirmation: true,
+            buttonText: 'Confirmar',
+            source: 'grupo-botones',
+            isConfirmationPage,
+            buttonClasses: confirmBtn.className
+          };
+        }
+      }
 
       // PRIORITIZE: Look for "Confirmar" button in the main content (NOT in modals)
       const mainContent = document.querySelector('main, .main-container, [role="main"]');
@@ -1902,14 +2169,13 @@ Respondé SOLO con JSON:
 
           // Found "Confirmar" in main content (not modal, not accordion) - THIS IS THE ONE
           if (text === 'Confirmar' && !inModal && !inAccordion) {
-            return { hasConfirmation: true, buttonText: 'Confirmar', source: 'main-content' };
+            return { hasConfirmation: true, buttonText: 'Confirmar', source: 'main-content', isConfirmationPage };
           }
         }
       }
 
-      // Only look for "Sí" if it's NOT in a cancellation modal
-      const buttons = document.querySelectorAll('button:not([disabled])');
-      for (const btn of buttons) {
+      // Also check for "Sí" button (but NOT in cancellation modal)
+      for (const btn of allButtons) {
         const text = btn.textContent.trim();
         const inAccordion = !!btn.closest('.accordion-collapse');
         const inModal = !!btn.closest('.modal, [role="dialog"]');
@@ -1918,7 +2184,6 @@ Respondé SOLO con JSON:
         if (text === 'Sí' && inModal) {
           const modal = btn.closest('.modal, [role="dialog"], app-modal-simple');
           const modalText = modal ? modal.innerText : '';
-          // Skip if modal mentions "cancelar" - it's asking to confirm cancellation!
           if (modalText.toLowerCase().includes('cancelar') || modalText.toLowerCase().includes('perderán')) {
             continue; // DON'T click this - it cancels the request!
           }
@@ -1926,26 +2191,51 @@ Respondé SOLO con JSON:
 
         // "Sí" button outside accordion and NOT in cancellation modal
         if (text === 'Sí' && !inAccordion && !inModal) {
-          return { hasConfirmation: true, buttonText: 'Sí', source: 'standalone' };
+          return { hasConfirmation: true, buttonText: 'Sí', source: 'standalone', isConfirmationPage };
         }
       }
 
-      return { hasConfirmation: false };
+      return { hasConfirmation: false, isConfirmationPage, allButtons: buttonInfo };
     });
+
+    // Log what we found on the confirmation page
+    if (confirmationCheck.isConfirmationPage && !confirmationCheck.hasConfirmation) {
+      console.log('[Final Step] ON CONFIRMATION PAGE but no Confirmar button found!');
+      console.log('[Final Step] Available buttons:', JSON.stringify(confirmationCheck.allButtons, null, 2));
+    }
 
     if (confirmationCheck.hasConfirmation) {
       console.log(`[Final Step] Found confirmation button: "${confirmationCheck.buttonText}" (${confirmationCheck.source}) - clicking it!`);
-      await page.evaluate((btnText) => {
+
+      // Use multiple click methods for better reliability
+      const clicked = await page.evaluate((btnText) => {
         const buttons = document.querySelectorAll('button:not([disabled])');
         for (const btn of buttons) {
           if (btn.textContent.trim() === btnText) {
+            // Multiple click methods
             btn.click();
-            return true;
+            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            return { success: true, text: btn.textContent.trim() };
           }
         }
-        return false;
+
+        // Also try grupo-botones specifically
+        const grupoBotones = document.querySelector('.grupo-botones');
+        if (grupoBotones) {
+          const confirmBtn = grupoBotones.querySelector('button.btn-primary');
+          if (confirmBtn) {
+            confirmBtn.click();
+            confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            return { success: true, text: confirmBtn.textContent.trim(), source: 'grupo-botones' };
+          }
+        }
+
+        return { success: false };
       }, confirmationCheck.buttonText);
+
+      console.log('[Final Step] Confirm button click result:', clicked);
       await delay(3000);
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => {});
       continue;
     }
 

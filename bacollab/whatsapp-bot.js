@@ -635,6 +635,13 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
         for (let i = 0; i < messagesToProcess.length; i++) {
           const m = messagesToProcess[i];
           if (m.photo) {
+            // Check if photo file exists (it may have been deleted after previous submission)
+            if (!fs.existsSync(m.photo)) {
+              console.log(`  [Photo] File no longer exists (already submitted?): ${path.basename(m.photo)}`);
+              m.photo = null; // Clear the reference
+              continue;
+            }
+
             try {
               const imageData = fs.readFileSync(m.photo);
               const base64 = imageData.toString('base64');
@@ -657,6 +664,7 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
               });
             } catch (e) {
               console.error('Error loading photo:', e);
+              m.photo = null; // Clear the reference on error
             }
           }
         }
@@ -671,9 +679,10 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
 
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
+          // Use Sonnet 4 for better image analysis (3x cost of Haiku but much better vision)
           const response = await anthropic.messages.create({
-            model: 'claude-haiku-4-5-20251001',
-            max_tokens: 500,
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 1000, // Increased to prevent truncation
             system: getSystemPrompt(),
             messages: [{ role: 'user', content }]
           });
@@ -681,10 +690,51 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
           const responseText = response.content[0].text;
           console.log('  [Claude raw]', responseText.substring(0, 200));
 
-          // Parse JSON response
-          const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            return JSON.parse(jsonMatch[0]);
+          // Parse JSON response - extract first complete JSON object
+          // Find the opening brace and then find the matching closing brace
+          const startIdx = responseText.indexOf('{');
+          if (startIdx !== -1) {
+            let braceCount = 0;
+            let endIdx = -1;
+            for (let i = startIdx; i < responseText.length; i++) {
+              if (responseText[i] === '{') braceCount++;
+              if (responseText[i] === '}') braceCount--;
+              if (braceCount === 0) {
+                endIdx = i;
+                break;
+              }
+            }
+            if (endIdx !== -1) {
+              const jsonStr = responseText.substring(startIdx, endIdx + 1);
+              try {
+                const result = JSON.parse(jsonStr);
+
+                // FALLBACK: If Claude returned empty requests but marked photo as invalid,
+                // and the text clearly mentions trash + has an address, create a default request
+                if (result.requests?.length === 0 && result.photoValid === false) {
+                  const fullText = pending.messages.map(m => m.text || '').join(' ').toLowerCase();
+                  const hasTrashKeywords = /basura|residuos|mugre|suciedad|contenedor|barrido/.test(fullText);
+                  const addressMatch = fullText.match(/([a-záéíóúñ]+\s+\d+)/i);
+
+                  if (hasTrashKeywords && addressMatch) {
+                    console.log('  [Claude] FALLBACK: Photo marked invalid but text has trash keywords + address');
+                    console.log(`  [Claude] Creating default "barrido" request for: ${addressMatch[1]}`);
+                    result.requests = [{
+                      address: addressMatch[1].split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '),
+                      reportType: 'barrido', // Default to barrido when photo unclear
+                      containerType: 'negro',
+                      msgIndex: 1
+                    }];
+                    result.photoValid = true; // Override
+                  }
+                }
+
+                return result;
+              } catch (parseErr) {
+                console.error('  [Claude] JSON parse error:', parseErr.message);
+                console.error('  [Claude] Attempted to parse:', jsonStr.substring(0, 200));
+              }
+            }
           }
 
           return { shouldRespond: true, requests: [], response: 'No entendí tu mensaje. ¿Podés decirme la dirección?' };
