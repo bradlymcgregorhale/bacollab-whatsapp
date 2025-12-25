@@ -410,29 +410,12 @@ class TrashReportBot {
         await this.submitRequest(pendingRequest);
         return;
       } else if (awaitingField === 'reportType' && lastMessage?.text) {
-        // Looking for report type clarification
+        // Looking for report type clarification - use Claude to interpret natural language
         console.log(`[Pending Info] User provided report type: "${lastMessage.text}"`);
 
-        // Map user response to reportType
-        const responseText = lastMessage.text.toLowerCase();
-        let reportType = 'recoleccion'; // default
-
-        if (responseText.includes('local comercial') || responseText.includes('ocupacion comercial') || responseText.includes('ocupación comercial')) {
-          reportType = 'ocupacion_comercial';
-        } else if (responseText.includes('gastronom') || responseText.includes('restaurant') || responseText.includes('bar') || responseText.includes('mesas')) {
-          reportType = 'ocupacion_gastronomica';
-        } else if (responseText.includes('mantero') || responseText.includes('vendedor') || responseText.includes('ambulante')) {
-          reportType = 'manteros';
-        } else if (responseText.includes('obstrucc') || responseText.includes('bloqueado') || responseText.includes('bloqueando')) {
-          reportType = 'obstruccion';
-        } else if (responseText.includes('barrido') || responseText.includes('barrer') || responseText.includes('mugre') || responseText.includes('suciedad')) {
-          reportType = 'barrido';
-        } else if (responseText.includes('basura') || responseText.includes('residuo') || responseText.includes('contenedor') || responseText.includes('recolec')) {
-          reportType = 'recoleccion';
-        }
-
+        const reportType = await this.extractReportType(lastMessage.text);
         pendingRequest.reportType = reportType;
-        console.log(`[Pending Info] Mapped to reportType: ${reportType}`);
+        console.log(`[Pending Info] Claude mapped to reportType: ${reportType}`);
 
         this.pendingInfoRequests.delete(senderId);
         pendingMessages.delete(senderId);
@@ -914,6 +897,41 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     }
 
     isProcessingQueue = false;
+  }
+
+  // Helper to extract report type from user's natural language response using Claude
+  async extractReportType(rawText) {
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-20250514',
+        max_tokens: 50,
+        system: `Clasificá la respuesta del usuario en UNO de estos tipos de reporte:
+- recoleccion: basura, residuos, contenedor desbordando, bolsas en la vereda
+- barrido: calle sucia, mugre, tierra, hojas, necesita barrer
+- obstruccion: algo bloqueando la vereda o calle, caños, fierros
+- ocupacion_comercial: local/negocio/kiosco/comercio poniendo cosas en la vereda
+- ocupacion_gastronomica: restaurant/bar/café con mesas en la vereda
+- manteros: vendedores ambulantes, manteros, venta ilegal en la calle
+
+Respondé SOLO con una de estas palabras: recoleccion, barrido, obstruccion, ocupacion_comercial, ocupacion_gastronomica, manteros`,
+        messages: [{ role: 'user', content: rawText }]
+      });
+
+      const result = response.content[0].text.trim().toLowerCase();
+      const validTypes = ['recoleccion', 'barrido', 'obstruccion', 'ocupacion_comercial', 'ocupacion_gastronomica', 'manteros'];
+
+      if (validTypes.includes(result)) {
+        console.log(`  [ReportType] Extracted: "${rawText}" → "${result}"`);
+        return result;
+      }
+
+      // If Claude returned something unexpected, default to recoleccion
+      console.log(`  [ReportType] Unexpected response "${result}", defaulting to recoleccion`);
+      return 'recoleccion';
+    } catch (e) {
+      console.error('  [ReportType] Error extracting type:', e.message);
+      return 'recoleccion'; // Safe default
+    }
   }
 
   // Helper to extract clean address from user's text response using Claude
