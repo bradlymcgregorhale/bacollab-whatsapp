@@ -384,10 +384,29 @@ class TrashReportBot {
 
       // Handle based on what field we're waiting for
       if (awaitingField === 'photo') {
-        // Looking for a photo
-        const photoMsg = pending.messages.find(m => m.photo);
+        // Looking for a photo - first check new messages
+        let photoMsg = pending.messages.find(m => m.photo);
+
+        if (!photoMsg?.photo && lastMessage?.text) {
+          // User responded with text - check if they're saying they already sent it
+          const alreadySentPhrases = /ya (la |lo |te |se )?(mand[eéó]|envi[eéó])|se envi[oó]|est[aá] (arriba|antes|ah[ií])|la foto.*(arriba|antes)|mand[eéó].*(antes|arriba|foto)/i;
+
+          if (alreadySentPhrases.test(lastMessage.text)) {
+            console.log(`[Pending Info] User says photo was already sent, checking history...`);
+
+            // Look for photos in userMessageHistory
+            const userHistory = userMessageHistory.get(senderId) || [];
+            const historyPhoto = [...userHistory].reverse().find(m => m.photo && fs.existsSync(m.photo));
+
+            if (historyPhoto?.photo) {
+              console.log(`[Pending Info] Found photo in history: ${historyPhoto.photo}`);
+              photoMsg = historyPhoto;
+            }
+          }
+        }
+
         if (photoMsg?.photo) {
-          console.log(`[Pending Info] User provided photo: ${photoMsg.photo}`);
+          console.log(`[Pending Info] Using photo: ${photoMsg.photo}`);
           pendingRequest.photo = photoMsg.photo;
 
           this.pendingInfoRequests.delete(senderId);
@@ -395,6 +414,19 @@ class TrashReportBot {
 
           console.log(`[Pending Info] Resubmitting with photo`);
           await this.submitRequest(pendingRequest);
+          return;
+        }
+
+        // If user said they already sent it but we couldn't find it, tell them
+        if (lastMessage?.text && /ya|envi|mand|arriba|antes/i.test(lastMessage.text)) {
+          const chat = pendingRequest.chat;
+          const senderInfo = this.senderIdCache?.get(senderId);
+          const mentions = senderInfo ? [senderInfo.senderId] : [];
+          const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+
+          console.log(`[Pending Info] Photo not found in history, asking for new one`);
+          await chat.sendMessage(`${mentionText} No encontré la foto anterior (puede que ya se haya usado). ¿Podés mandarla de nuevo?`.trim(), { mentions });
+          // Keep waiting for photo
           return;
         }
       } else if (awaitingField === 'address' && lastMessage?.text) {
