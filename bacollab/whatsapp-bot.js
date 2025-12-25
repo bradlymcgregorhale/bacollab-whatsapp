@@ -1196,15 +1196,45 @@ Respondé SOLO con la dirección limpia, nada más.`,
     return processed;
   }
 
+  // Normalize address for duplicate comparison
+  // Strips conversational prefixes, normalizes accents, extracts just "street + number"
+  normalizeAddressForComparison(address) {
+    if (!address) return '';
+
+    let normalized = address.toLowerCase()
+      // Remove accents for comparison
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      // Remove common conversational prefixes/suffixes
+      .replace(/^(es |es en |esta en |al |no |no es |quise decir |perdon |por favor |dale )/gi, '')
+      .replace(/(, ?no .*$| no .*$)/gi, '') // Remove ", no Irigoyen" etc.
+      // Normalize "al" before numbers: "yrigoyen al 3150" -> "yrigoyen 3150"
+      .replace(/\s+al\s+(\d)/gi, ' $1')
+      .trim();
+
+    // Extract just street name + number pattern
+    const match = normalized.match(/([a-z\s\.]+)\s*(\d+)/i);
+    if (match) {
+      return `${match[1].trim()} ${match[2]}`;
+    }
+
+    return normalized;
+  }
+
   // Check if address was submitted in last 24 hours
   isRecentDuplicate(address, processedMap) {
-    const entry = processedMap.get(address.toLowerCase());
-    if (!entry) return null;
+    const normalizedNew = this.normalizeAddressForComparison(address);
 
-    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-    if (entry.timestamp > twentyFourHoursAgo) {
-      return entry; // Return the entry so we can show the solicitud number
+    // Check against all processed addresses (normalized)
+    for (const [storedAddr, entry] of processedMap) {
+      const normalizedStored = this.normalizeAddressForComparison(storedAddr);
+      if (normalizedNew === normalizedStored) {
+        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+        if (entry.timestamp > twentyFourHoursAgo) {
+          return entry;
+        }
+      }
     }
+
     return null;
   }
 
