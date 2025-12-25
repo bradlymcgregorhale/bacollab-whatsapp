@@ -398,14 +398,15 @@ class TrashReportBot {
           return;
         }
       } else if (awaitingField === 'address' && lastMessage?.text) {
-        // Looking for address
-        console.log(`[Pending Info] User provided address: "${lastMessage.text}"`);
-        pendingRequest.address = lastMessage.text;
+        // Looking for address - extract clean address from user's response
+        console.log(`[Pending Info] User provided address response: "${lastMessage.text}"`);
+        const cleanAddress = await this.extractCleanAddress(lastMessage.text);
+        pendingRequest.address = cleanAddress;
 
         this.pendingInfoRequests.delete(senderId);
         pendingMessages.delete(senderId);
 
-        console.log(`[Pending Info] Resubmitting with new address`);
+        console.log(`[Pending Info] Resubmitting with cleaned address: "${cleanAddress}"`);
         await this.submitRequest(pendingRequest);
         return;
       } else if (lastMessage?.text) {
@@ -832,6 +833,36 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     }
 
     isProcessingQueue = false;
+  }
+
+  // Helper to extract clean address from user's text response using Claude
+  async extractCleanAddress(rawText) {
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-20250514',
+        max_tokens: 100,
+        system: `Extraé SOLO la dirección (calle + número) del texto del usuario.
+Eliminá texto conversacional como "es", "no", "al", "quise decir", "perdón", etc.
+Aplicá estos alias:
+- "Irigoyen" / "Hipolito Irigoyen" → "Hipólito Yrigoyen"
+- "Corrientes" → "Av. Corrientes"
+- "Callao" → "Av. Callao"
+Respondé SOLO con la dirección limpia, nada más.`,
+        messages: [{ role: 'user', content: rawText }]
+      });
+
+      const cleanAddress = response.content[0].text.trim();
+      console.log(`  [Address] Extracted: "${rawText}" → "${cleanAddress}"`);
+      return cleanAddress;
+    } catch (e) {
+      console.error('  [Address] Error extracting address:', e.message);
+      // Fallback: try simple regex extraction
+      const match = rawText.match(/([A-ZÁÉÍÓÚÑa-záéíóúñ\s\.]+)\s+(\d+)/);
+      if (match) {
+        return `${match[1].trim()} ${match[2]}`;
+      }
+      return rawText; // Last resort: use raw text
+    }
   }
 
   // Helper to remove address from dedup map (allows manual retry after failure)
