@@ -676,6 +676,9 @@ class TrashReportBot {
           await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${descriptionText}...`.trim(), { mentions });
           console.log(`  [Bot] Procesando: ${descriptionText}`);
 
+          // Check if user requested posting to X/Twitter
+          const shouldPostToX = this.shouldPostToX(pending.messages);
+
           let queuedCount = 0;
           for (const req of newRequests) {
             // In-memory dedup: skip if this address was queued recently
@@ -711,7 +714,8 @@ class TrashReportBot {
               containerType: req.containerType || 'negro',
               schedule: req.schedule || null, // For manteros: days/times
               photo,
-              chat
+              chat,
+              postToX: shouldPostToX
             });
             queuedCount++;
           }
@@ -968,6 +972,30 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
     isProcessingQueue = false;
   }
 
+  // Helper to check if messages contain a request to post to X/Twitter
+  shouldPostToX(messages) {
+    const xPatterns = [
+      /subir\s*(a\s*)?(x|twitter)/i,
+      /postea(r)?\s*(a\s*)?(x|twitter)/i,
+      /publica(r)?\s*(en\s*)?(x|twitter)/i,
+      /twittea(r)?/i,
+      /manda(r)?\s*(a\s*)?(x|twitter)/i,
+      /\bx\b.*\btwitter\b|\btwitter\b.*\bx\b/i,  // mentions both X and Twitter
+    ];
+
+    for (const msg of messages) {
+      if (msg.text) {
+        for (const pattern of xPatterns) {
+          if (pattern.test(msg.text)) {
+            console.log(`  [X] Detected post request in: "${msg.text}"`);
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   // Helper to extract report type from user's natural language response using Claude
   async extractReportType(rawText) {
     try {
@@ -1046,7 +1074,7 @@ Respondé SOLO con la dirección limpia, nada más.`,
   }
 
   async submitRequest(request, isRetry = false) {
-    const { senderId, senderName, address, reportType = 'recoleccion', containerType, schedule, photo, chat } = request;
+    const { senderId, senderName, address, reportType = 'recoleccion', containerType, schedule, photo, chat, postToX: shouldPostToX } = request;
     const senderInfo = this.senderIdCache?.get(senderId);
     const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
     const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : `@${senderId.split('@')[0]}`;
@@ -1107,23 +1135,25 @@ Respondé SOLO con la dirección limpia, nada más.`,
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada: #${result.solicitudNumber}`);
 
-        // Post to X/Twitter (before cleaning up photo)
-        try {
-          const xResult = await postToX({
-            address,
-            reportType,
-            solicitudNumber: result.solicitudNumber,
-            photoPath: photo
-          });
-          if (xResult.skipped) {
-            console.log(`  [X] Omitido (duplicado): ${result.solicitudNumber}`);
-          } else if (xResult.success) {
-            console.log(`  [X] Publicado en X/Twitter`);
-          } else {
-            console.log(`  [X] Error publicando en X: ${xResult.error}`);
+        // Post to X/Twitter only if user requested it (before cleaning up photo)
+        if (shouldPostToX) {
+          try {
+            const xResult = await postToX({
+              address,
+              reportType,
+              solicitudNumber: result.solicitudNumber,
+              photoPath: photo
+            });
+            if (xResult.skipped) {
+              console.log(`  [X] Omitido (duplicado): ${result.solicitudNumber}`);
+            } else if (xResult.success) {
+              console.log(`  [X] Publicado en X/Twitter`);
+            } else {
+              console.log(`  [X] Error publicando en X: ${xResult.error}`);
+            }
+          } catch (xError) {
+            console.error(`  [X] Error publicando en X:`, xError.message);
           }
-        } catch (xError) {
-          console.error(`  [X] Error publicando en X:`, xError.message);
         }
 
         // Clean up photo after successful submission and X posting
@@ -1135,23 +1165,25 @@ Respondé SOLO con la dirección limpia, nada más.`,
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada (sin número)`);
 
-        // Post to X/Twitter even without solicitud number
-        try {
-          const xResult = await postToX({
-            address,
-            reportType,
-            solicitudNumber: 'sin número',
-            photoPath: photo
-          });
-          if (xResult.skipped) {
-            console.log(`  [X] Omitido (duplicado)`);
-          } else if (xResult.success) {
-            console.log(`  [X] Publicado en X/Twitter`);
-          } else {
-            console.log(`  [X] Error publicando en X: ${xResult.error}`);
+        // Post to X/Twitter only if user requested it (even without solicitud number)
+        if (shouldPostToX) {
+          try {
+            const xResult = await postToX({
+              address,
+              reportType,
+              solicitudNumber: 'sin número',
+              photoPath: photo
+            });
+            if (xResult.skipped) {
+              console.log(`  [X] Omitido (duplicado)`);
+            } else if (xResult.success) {
+              console.log(`  [X] Publicado en X/Twitter`);
+            } else {
+              console.log(`  [X] Error publicando en X: ${xResult.error}`);
+            }
+          } catch (xError) {
+            console.error(`  [X] Error publicando en X:`, xError.message);
           }
-        } catch (xError) {
-          console.error(`  [X] Error publicando en X:`, xError.message);
         }
 
         // Clean up photo after successful submission and X posting
@@ -1579,6 +1611,9 @@ Respondé SOLO con la dirección limpia, nada más.`,
         }
 
         if (extraction.requests && extraction.requests.length > 0) {
+          // Check if user requested posting to X/Twitter
+          const shouldPostToX = this.shouldPostToX(userData.messages);
+
           for (const req of extraction.requests) {
             // Skip if no address
             if (!req.address) {
@@ -1613,7 +1648,8 @@ Respondé SOLO con la dirección limpia, nada más.`,
               containerType: req.containerType || 'negro',
               schedule: req.schedule || null,
               photo,
-              chat: targetChat
+              chat: targetChat,
+              postToX: shouldPostToX
             });
           }
         }
