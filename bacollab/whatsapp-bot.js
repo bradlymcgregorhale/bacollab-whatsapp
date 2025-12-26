@@ -7,6 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import puppeteer from 'puppeteer';
+import { postToX, initXPoster, closeXBrowser } from './x-poster.js';
 
 dotenv.config();
 
@@ -1106,7 +1107,24 @@ Respondé SOLO con la dirección limpia, nada más.`,
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada: #${result.solicitudNumber}`);
 
-        // Clean up photo after successful submission
+        // Post to X/Twitter (before cleaning up photo)
+        try {
+          const xResult = await postToX({
+            address,
+            reportType,
+            solicitudNumber: result.solicitudNumber,
+            photoPath: photo
+          });
+          if (xResult.success) {
+            console.log(`  [X] Publicado en X/Twitter`);
+          } else {
+            console.log(`  [X] Error publicando en X: ${xResult.error}`);
+          }
+        } catch (xError) {
+          console.error(`  [X] Error publicando en X:`, xError.message);
+        }
+
+        // Clean up photo after successful submission and X posting
         if (photo) {
           try { fs.unlinkSync(photo); } catch (e) {}
         }
@@ -1115,7 +1133,24 @@ Respondé SOLO con la dirección limpia, nada más.`,
         await chat.sendMessage(successMsg, { mentions });
         console.log(`  [Bot] Solicitud enviada (sin número)`);
 
-        // Clean up photo after successful submission
+        // Post to X/Twitter even without solicitud number
+        try {
+          const xResult = await postToX({
+            address,
+            reportType,
+            solicitudNumber: 'sin número',
+            photoPath: photo
+          });
+          if (xResult.success) {
+            console.log(`  [X] Publicado en X/Twitter`);
+          } else {
+            console.log(`  [X] Error publicando en X: ${xResult.error}`);
+          }
+        } catch (xError) {
+          console.error(`  [X] Error publicando en X:`, xError.message);
+        }
+
+        // Clean up photo after successful submission and X posting
         if (photo) {
           try { fs.unlinkSync(photo); } catch (e) {}
         }
@@ -1658,6 +1693,18 @@ Respondé SOLO con la dirección limpia, nada más.`,
       console.log(`[4/4] Inicialización completa (${elapsed}s total)`);
 
       console.log('[Retry] Sistema de reintentos activado (5min, 50min, 500min)');
+
+      // Initialize X poster (login to X/Twitter)
+      console.log('[X] Inicializando publicador de X/Twitter...');
+      initXPoster().then(success => {
+        if (success) {
+          console.log('[X] Publicador de X listo!');
+        } else {
+          console.log('[X] Publicador de X no disponible - las publicaciones fallarán');
+        }
+      }).catch(err => {
+        console.error('[X] Error inicializando publicador de X:', err.message);
+      });
     } catch (err) {
       console.error('[DEBUG] Error durante inicialización:', err);
       process.exit(1);
@@ -1673,5 +1720,6 @@ bot.start();
 process.on('SIGINT', async () => {
   console.log('\nCerrando bot...');
   await bot.client.destroy();
+  await closeXBrowser();
   process.exit(0);
 });

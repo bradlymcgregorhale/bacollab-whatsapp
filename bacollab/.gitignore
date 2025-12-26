@@ -28,3 +28,9 @@ photos/
 
 # Debug screenshots
 *.png
+
+# X/Twitter session data (contains login credentials)
+.x-user-data/
+.x-chrome-profile/
+.x-browser-data/
+.x-cookies.json
