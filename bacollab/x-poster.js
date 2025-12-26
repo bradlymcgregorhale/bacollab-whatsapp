@@ -455,7 +455,6 @@ export async function postToX({ address, reportType, solicitudNumber, photoPath 
     // Build tweet text
     const reportLabel = REPORT_TYPE_LABELS[reportType] || 'recolección de residuos';
     const tweetText = `${address} - ${reportLabel}
-${solicitudNumber}
 @ibaistrocchi
 @jorgemacri`;
 
