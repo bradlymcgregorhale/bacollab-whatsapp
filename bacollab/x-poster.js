@@ -25,6 +25,10 @@ let xBrowser = null;
 let xPage = null;
 let isXLoggedIn = false;
 
+// Track recently posted solicitudes to prevent duplicates
+const recentlyPosted = new Set();
+const DEDUP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+
 // Report type labels in Spanish
 const REPORT_TYPE_LABELS = {
   recoleccion: 'recolección de residuos',
@@ -411,6 +415,17 @@ export async function postToX({ address, reportType, solicitudNumber, photoPath 
   console.log(`[X] Type: ${reportType}`);
   console.log(`[X] Case #: ${solicitudNumber}`);
   console.log(`[X] Photo: ${photoPath}`);
+
+  // Deduplication check - prevent posting same solicitud twice
+  const dedupKey = solicitudNumber || `${address}-${Date.now()}`;
+  if (recentlyPosted.has(dedupKey)) {
+    console.log(`[X] Skipping duplicate post for ${dedupKey}`);
+    return { success: true, skipped: true, reason: 'duplicate' };
+  }
+
+  // Mark as posted and set expiry
+  recentlyPosted.add(dedupKey);
+  setTimeout(() => recentlyPosted.delete(dedupKey), DEDUP_EXPIRY_MS);
 
   try {
     const loggedIn = await ensureLoggedIn();

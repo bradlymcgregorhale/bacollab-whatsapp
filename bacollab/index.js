@@ -50,6 +50,13 @@ let browser = null;
 let page = null;
 let isLoggedIn = false;
 
+// Deduplication: prevent submitting same address twice within time window
+const recentSubmissions = new Map(); // address -> { timestamp, solicitudNumber }
+const SUBMISSION_DEDUP_MS = 5 * 60 * 1000; // 5 minutes
+
+// Per-address locks to prevent concurrent submissions
+const submissionLocks = new Map(); // address -> Promise
+
 const URLS = {
   prestaciones: 'https://bacolaborativa.buenosaires.gob.ar/prestaciones',
   recoleccion: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1462821007742',
@@ -2555,6 +2562,15 @@ app.post('/login', async (req, res) => {
   }
 });
 
+// Normalize address for deduplication
+function normalizeAddressForDedup(address) {
+  return address
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // Remove accents
+    .replace(/[^a-z0-9]/g, '') // Remove non-alphanumeric
+    .trim();
+}
+
 // Submit solicitud endpoint
 app.post('/solicitud', async (req, res) => {
   const { address, containerType, description, photos, reportType, schedule } = req.body;
@@ -2564,6 +2580,38 @@ app.post('/solicitud', async (req, res) => {
   }
 
   console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"${schedule ? `, schedule="${schedule}"` : ''}`);
+
+  // Deduplication check - prevent submitting same address twice
+  const normalizedAddr = normalizeAddressForDedup(address);
+  const recent = recentSubmissions.get(normalizedAddr);
+  if (recent && (Date.now() - recent.timestamp) < SUBMISSION_DEDUP_MS) {
+    console.log(`[DEDUP] Blocking duplicate submission for "${address}" (submitted ${Math.round((Date.now() - recent.timestamp) / 1000)}s ago as #${recent.solicitudNumber})`);
+    return res.json({
+      success: true,
+      solicitudNumber: recent.solicitudNumber,
+      message: `Ya se envió esta solicitud hace menos de 5 minutos (#${recent.solicitudNumber})`,
+      duplicate: true
+    });
+  }
+
+  // Per-address locking - wait if another submission for same address is in progress
+  if (submissionLocks.has(normalizedAddr)) {
+    console.log(`[LOCK] Waiting for in-progress submission for "${address}"...`);
+    try {
+      const existingResult = await submissionLocks.get(normalizedAddr);
+      if (existingResult && existingResult.success) {
+        console.log(`[LOCK] Returning result from concurrent submission: #${existingResult.solicitudNumber}`);
+        return res.json({ ...existingResult, duplicate: true });
+      }
+    } catch (e) {
+      console.log(`[LOCK] Previous submission failed, proceeding with new one`);
+    }
+  }
+
+  // Create a promise for this submission that others can wait on
+  let resolveSubmission;
+  const submissionPromise = new Promise(resolve => { resolveSubmission = resolve; });
+  submissionLocks.set(normalizedAddr, submissionPromise);
 
   // Retry logic: if first attempt fails, close browser and try once more with fresh session
   const maxAttempts = 2;
@@ -2579,6 +2627,19 @@ app.post('/solicitud', async (req, res) => {
 
       // Close browser after successful submission
       await closeBrowser();
+
+      // Record successful submission for deduplication
+      if (result.success && result.solicitudNumber) {
+        recentSubmissions.set(normalizedAddr, {
+          timestamp: Date.now(),
+          solicitudNumber: result.solicitudNumber
+        });
+        console.log(`[DEDUP] Recorded submission for "${address}" -> #${result.solicitudNumber}`);
+      }
+
+      // Resolve for any waiting concurrent requests
+      resolveSubmission(result);
+      submissionLocks.delete(normalizedAddr);
 
       return res.json(result);
     } catch (error) {
@@ -2604,6 +2665,10 @@ app.post('/solicitud', async (req, res) => {
       }
     }
   }
+
+  // Cleanup lock on failure
+  resolveSubmission(null);
+  submissionLocks.delete(normalizedAddr);
 
   res.status(500).json({ success: false, error: lastError.message });
 });

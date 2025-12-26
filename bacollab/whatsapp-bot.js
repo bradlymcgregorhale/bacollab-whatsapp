@@ -1115,7 +1115,9 @@ Respondé SOLO con la dirección limpia, nada más.`,
             solicitudNumber: result.solicitudNumber,
             photoPath: photo
           });
-          if (xResult.success) {
+          if (xResult.skipped) {
+            console.log(`  [X] Omitido (duplicado): ${result.solicitudNumber}`);
+          } else if (xResult.success) {
             console.log(`  [X] Publicado en X/Twitter`);
           } else {
             console.log(`  [X] Error publicando en X: ${xResult.error}`);
@@ -1141,7 +1143,9 @@ Respondé SOLO con la dirección limpia, nada más.`,
             solicitudNumber: 'sin número',
             photoPath: photo
           });
-          if (xResult.success) {
+          if (xResult.skipped) {
+            console.log(`  [X] Omitido (duplicado)`);
+          } else if (xResult.success) {
             console.log(`  [X] Publicado en X/Twitter`);
           } else {
             console.log(`  [X] Error publicando en X: ${xResult.error}`);
