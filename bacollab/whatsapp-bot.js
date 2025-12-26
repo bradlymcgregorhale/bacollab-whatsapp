@@ -66,9 +66,13 @@ const requestQueue = [];
 let isProcessingQueue = false;
 
 // In-memory tracker to prevent duplicate submissions within same session
-// Key: address (lowercase), Value: timestamp when queued/submitted
+// Key: address (normalized), Value: timestamp when queued/submitted
 const recentlyQueuedAddresses = new Map();
 const QUEUE_DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+// Per-user processing lock to prevent concurrent batch processing
+// Key: senderId, Value: Promise that resolves when processing completes
+const userProcessingLocks = new Map();
 
 // Pending messages buffer - collects messages before processing
 // Key: senderId, Value: { messages: [], timer: null, senderName: string }
@@ -361,6 +365,28 @@ class TrashReportBot {
   }
 
   async processPendingMessages(senderId) {
+    // Acquire per-user processing lock to prevent concurrent batch processing
+    const existingLock = userProcessingLocks.get(senderId);
+    if (existingLock) {
+      console.log(`  [Lock] Waiting for previous processing to complete for ${senderId.split('@')[0]}...`);
+      await existingLock;
+    }
+
+    // Create a new lock for this processing session
+    let releaseLock;
+    const lockPromise = new Promise(resolve => { releaseLock = resolve; });
+    userProcessingLocks.set(senderId, lockPromise);
+
+    try {
+      await this._processPendingMessagesImpl(senderId);
+    } finally {
+      // Release the lock
+      userProcessingLocks.delete(senderId);
+      releaseLock();
+    }
+  }
+
+  async _processPendingMessagesImpl(senderId) {
     const pending = pendingMessages.get(senderId);
     if (!pending || pending.messages.length === 0) {
       pendingMessages.delete(senderId);
@@ -652,10 +678,11 @@ class TrashReportBot {
           let queuedCount = 0;
           for (const req of newRequests) {
             // In-memory dedup: skip if this address was queued recently
-            const addrKey = req.address.toLowerCase();
+            // Use normalizeAddressForComparison for consistent key generation
+            const addrKey = this.normalizeAddressForComparison(req.address);
             const recentlyQueued = recentlyQueuedAddresses.get(addrKey);
             if (recentlyQueued && (Date.now() - recentlyQueued) < QUEUE_DEDUP_WINDOW_MS) {
-              console.log(`  [Dedup] Skipping ${req.address} - queued ${Math.round((Date.now() - recentlyQueued) / 1000)}s ago`);
+              console.log(`  [Dedup] Skipping ${req.address} (key: ${addrKey}) - queued ${Math.round((Date.now() - recentlyQueued) / 1000)}s ago`);
               continue;
             }
 
@@ -671,8 +698,9 @@ class TrashReportBot {
               photo = matchingMsg?.photo || [...pending.messages].reverse().find(m => m.photo)?.photo || null;
             }
 
-            // Mark as queued
+            // Mark as queued with normalized key
             recentlyQueuedAddresses.set(addrKey, Date.now());
+            console.log(`  [Dedup] Added ${req.address} (key: ${addrKey}) to dedup map`);
 
             requestQueue.push({
               senderId,
@@ -1533,7 +1561,11 @@ Respondé SOLO con la dirección limpia, nada más.`,
               photo = [...userData.messages].reverse().find(m => m.photo)?.photo || null;
             }
 
-            console.log(`[Startup] Encontrado pendiente: ${req.address}`);
+            // Add to in-memory dedup map to prevent duplicate queuing
+            const addrKey = this.normalizeAddressForComparison(req.address);
+            recentlyQueuedAddresses.set(addrKey, Date.now());
+
+            console.log(`[Startup] Encontrado pendiente: ${req.address} (key: ${addrKey})`);
             requestQueue.push({
               senderId,
               senderName,
