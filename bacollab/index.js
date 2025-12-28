@@ -1253,22 +1253,9 @@ async function submitSolicitud(data) {
       if (btn) {
         result.html = btn.outerHTML;
 
-        // Method 1: Standard click
+        // Single click - don't use multiple methods as it causes duplicate submissions
         btn.click();
         result.methods.push('click');
-
-        // Method 2: Dispatch MouseEvent (works better with Angular)
-        btn.dispatchEvent(new MouseEvent('click', {
-          bubbles: true,
-          cancelable: true,
-          view: window
-        }));
-        result.methods.push('MouseEvent');
-
-        // Method 3: Focus and trigger
-        btn.focus();
-        btn.dispatchEvent(new Event('focus', { bubbles: true }));
-        result.methods.push('focus');
 
         result.success = true;
         result.method = 'form-actions';
@@ -1284,12 +1271,12 @@ async function submitSolicitud(data) {
       const isInAccordion = btn.closest('.accordion-body');
       if (!isInAccordion && (text.includes('Siguiente') || text.includes('Confirmar'))) {
         result.html = btn.outerHTML;
+        // Single click - don't use multiple methods as it causes duplicate submissions
         btn.click();
-        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
         result.success = true;
         result.method = 'fallback';
         result.text = text.trim();
-        result.methods.push('click', 'MouseEvent');
+        result.methods.push('click');
         return result;
       }
     }
@@ -1968,14 +1955,9 @@ Respondé SOLO con JSON:
               if (formActions) {
                 const formBtn = formActions.querySelector('button.btn-primary:not([disabled])');
                 if (formBtn && formBtn.textContent.trim().includes(btnText)) {
-                  // Try click()
+                  // Single click - don't use multiple methods as it causes duplicate submissions
                   formBtn.click();
                   result.methods.push('form-actions click');
-
-                  // Also try dispatching events
-                  formBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                  result.methods.push('form-actions dispatchEvent');
-
                   result.clicked = true;
                   result.text = formBtn.textContent.trim();
                   result.html = formBtn.outerHTML.substring(0, 150);
@@ -1987,8 +1969,8 @@ Respondé SOLO con JSON:
               const buttons = document.querySelectorAll('button:not([disabled])');
               for (const btn of buttons) {
                 if (btn.textContent.trim().includes(btnText) || btn.textContent.trim() === btnText) {
+                  // Single click - don't use multiple methods as it causes duplicate submissions
                   btn.click();
-                  btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                   result.clicked = true;
                   result.text = btn.textContent.trim();
                   result.methods.push('button click');
@@ -2234,9 +2216,8 @@ Respondé SOLO con JSON:
         const buttons = document.querySelectorAll('button:not([disabled])');
         for (const btn of buttons) {
           if (btn.textContent.trim() === btnText) {
-            // Multiple click methods
+            // Single click - don't use multiple methods as it causes duplicate submissions
             btn.click();
-            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
             return { success: true, text: btn.textContent.trim() };
           }
         }
@@ -2246,8 +2227,8 @@ Respondé SOLO con JSON:
         if (grupoBotones) {
           const confirmBtn = grupoBotones.querySelector('button.btn-primary');
           if (confirmBtn) {
+            // Single click - don't use multiple methods as it causes duplicate submissions
             confirmBtn.click();
-            confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
             return { success: true, text: confirmBtn.textContent.trim(), source: 'grupo-botones' };
           }
         }
@@ -2571,6 +2552,13 @@ function normalizeAddressForDedup(address) {
     .trim();
 }
 
+// Create dedup key combining address and report type
+function createDedupKey(address, reportType) {
+  const normalizedAddr = normalizeAddressForDedup(address);
+  const type = reportType || 'recoleccion';
+  return `${normalizedAddr}|${type}`;
+}
+
 // Submit solicitud endpoint
 app.post('/solicitud', async (req, res) => {
   const { address, containerType, description, photos, reportType, schedule } = req.body;
@@ -2581,11 +2569,11 @@ app.post('/solicitud', async (req, res) => {
 
   console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"${schedule ? `, schedule="${schedule}"` : ''}`);
 
-  // Deduplication check - prevent submitting same address twice
-  const normalizedAddr = normalizeAddressForDedup(address);
-  const recent = recentSubmissions.get(normalizedAddr);
+  // Deduplication check - prevent submitting same address+reportType twice
+  const dedupKey = createDedupKey(address, reportType);
+  const recent = recentSubmissions.get(dedupKey);
   if (recent && (Date.now() - recent.timestamp) < SUBMISSION_DEDUP_MS) {
-    console.log(`[DEDUP] Blocking duplicate submission for "${address}" (submitted ${Math.round((Date.now() - recent.timestamp) / 1000)}s ago as #${recent.solicitudNumber})`);
+    console.log(`[DEDUP] Blocking duplicate submission for "${address}" [${reportType || 'recoleccion'}] (submitted ${Math.round((Date.now() - recent.timestamp) / 1000)}s ago as #${recent.solicitudNumber})`);
     return res.json({
       success: true,
       solicitudNumber: recent.solicitudNumber,
@@ -2594,11 +2582,11 @@ app.post('/solicitud', async (req, res) => {
     });
   }
 
-  // Per-address locking - wait if another submission for same address is in progress
-  if (submissionLocks.has(normalizedAddr)) {
-    console.log(`[LOCK] Waiting for in-progress submission for "${address}"...`);
+  // Per-address+type locking - wait if another submission for same address+type is in progress
+  if (submissionLocks.has(dedupKey)) {
+    console.log(`[LOCK] Waiting for in-progress submission for "${address}" [${reportType || 'recoleccion'}]...`);
     try {
-      const existingResult = await submissionLocks.get(normalizedAddr);
+      const existingResult = await submissionLocks.get(dedupKey);
       if (existingResult && existingResult.success) {
         console.log(`[LOCK] Returning result from concurrent submission: #${existingResult.solicitudNumber}`);
         return res.json({ ...existingResult, duplicate: true });
@@ -2611,7 +2599,7 @@ app.post('/solicitud', async (req, res) => {
   // Create a promise for this submission that others can wait on
   let resolveSubmission;
   const submissionPromise = new Promise(resolve => { resolveSubmission = resolve; });
-  submissionLocks.set(normalizedAddr, submissionPromise);
+  submissionLocks.set(dedupKey, submissionPromise);
 
   // Retry logic: if first attempt fails, close browser and try once more with fresh session
   const maxAttempts = 2;
@@ -2630,16 +2618,16 @@ app.post('/solicitud', async (req, res) => {
 
       // Record successful submission for deduplication
       if (result.success && result.solicitudNumber) {
-        recentSubmissions.set(normalizedAddr, {
+        recentSubmissions.set(dedupKey, {
           timestamp: Date.now(),
           solicitudNumber: result.solicitudNumber
         });
-        console.log(`[DEDUP] Recorded submission for "${address}" -> #${result.solicitudNumber}`);
+        console.log(`[DEDUP] Recorded submission for "${address}" [${reportType || 'recoleccion'}] -> #${result.solicitudNumber}`);
       }
 
       // Resolve for any waiting concurrent requests
       resolveSubmission(result);
-      submissionLocks.delete(normalizedAddr);
+      submissionLocks.delete(dedupKey);
 
       return res.json(result);
     } catch (error) {
@@ -2668,7 +2656,7 @@ app.post('/solicitud', async (req, res) => {
 
   // Cleanup lock on failure
   resolveSubmission(null);
-  submissionLocks.delete(normalizedAddr);
+  submissionLocks.delete(dedupKey);
 
   res.status(500).json({ success: false, error: lastError.message });
 });

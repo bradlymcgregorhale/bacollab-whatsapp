@@ -51,7 +51,7 @@ const REPORTS_LOG = path.join(__dirname, 'reports.csv');
 
 // Initialize reports log with header if it doesn't exist
 if (!fs.existsSync(REPORTS_LOG)) {
-  fs.writeFileSync(REPORTS_LOG, 'numero,fecha,direccion,link,timestamp\n');
+  fs.writeFileSync(REPORTS_LOG, 'numero,fecha,direccion,reportType,link,timestamp\n');
 }
 
 // Errors log file
@@ -626,15 +626,15 @@ class TrashReportBot {
         const mentions = senderInfo ? [senderInfo.senderId] : [];
         const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
 
-        // Check for duplicates in last 24 hours
+        // Check for duplicates in last 12 hours (per address + report type)
         const processedAddresses = this.getProcessedSolicitudes();
         const newRequests = [];
         const duplicates = [];
 
         for (const req of extraction.requests) {
-          const recentDupe = this.isRecentDuplicate(req.address, processedAddresses);
+          const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses);
           if (recentDupe) {
-            duplicates.push({ address: req.address, solicitudNumber: recentDupe.solicitudNumber });
+            duplicates.push({ address: req.address, reportType: req.reportType, solicitudNumber: recentDupe.solicitudNumber });
           } else {
             newRequests.push(req);
           }
@@ -642,13 +642,22 @@ class TrashReportBot {
 
         // Notify about duplicates
         if (duplicates.length > 0) {
+          const reportLabelsForDupe = {
+            recoleccion: 'recolección',
+            barrido: 'barrido',
+            obstruccion: 'obstrucción',
+            ocupacion_comercial: 'ocupación comercial',
+            ocupacion_gastronomica: 'ocupación gastronómica',
+            manteros: 'manteros'
+          };
           for (const dupe of duplicates) {
             const dupeUrl = `https://bacolaborativa.buenosaires.gob.ar/detalleSolicitud/${dupe.solicitudNumber.replace(/\//g, '&')}?vieneDeMisSolicitudes=false`;
+            const typeLabel = reportLabelsForDupe[dupe.reportType] || 'recolección';
             await chat.sendMessage(
-              `${mentionText} Ya mandé una solicitud para ${dupe.address} en las últimas 24 horas (#${dupe.solicitudNumber}).\n${dupeUrl}`.trim(),
+              `${mentionText} Ya mandé una solicitud de ${typeLabel} para ${dupe.address} en las últimas 12 horas (#${dupe.solicitudNumber}).\n${dupeUrl}`.trim(),
               { mentions }
             );
-            console.log(`  [Bot] Duplicado detectado: ${dupe.address} (#${dupe.solicitudNumber})`);
+            console.log(`  [Bot] Duplicado detectado: ${dupe.address} [${dupe.reportType}] (#${dupe.solicitudNumber})`);
           }
         }
 
@@ -975,11 +984,11 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
   // Helper to check if messages contain a request to post to X/Twitter
   shouldPostToX(messages) {
     const xPatterns = [
-      /subir\s*(a\s*)?(x|twitter)/i,
-      /postea(r)?\s*(a\s*)?(x|twitter)/i,
-      /publica(r)?\s*(en\s*)?(x|twitter)/i,
-      /twittea(r)?/i,
-      /manda(r)?\s*(a\s*)?(x|twitter)/i,
+      /subi(r|lo)?\s*(a\s*)?(x|twitter)/i,  // "subi a twitter", "subir a X", "subilo a twitter"
+      /postea(r|lo)?\s*(a\s*)?(x|twitter)/i,
+      /publica(r|lo)?\s*(en\s*)?(x|twitter)/i,
+      /twittea(r|lo)?/i,
+      /manda(r|lo)?\s*(a\s*)?(x|twitter)/i,
       /\bx\b.*\btwitter\b|\btwitter\b.*\bx\b/i,  // mentions both X and Twitter
     ];
 
@@ -1123,13 +1132,13 @@ Respondé SOLO con la dirección limpia, nada más.`,
         // Format solicitud number for URL (replace / with &)
         const solicitudUrl = `https://bacolaborativa.buenosaires.gob.ar/detalleSolicitud/${result.solicitudNumber.replace(/\//g, '&')}?vieneDeMisSolicitudes=false`;
 
-        // Log to CSV file
+        // Log to CSV file (with reportType for per-type deduplication)
         const today = new Date();
         const dateStr = `${today.getDate().toString().padStart(2, '0')}/${(today.getMonth() + 1).toString().padStart(2, '0')}/${today.getFullYear()}`;
         const timestamp = Date.now();
-        const csvLine = `${result.solicitudNumber},${dateStr},"${address}",${solicitudUrl},${timestamp}\n`;
+        const csvLine = `${result.solicitudNumber},${dateStr},"${address}",${reportType},${solicitudUrl},${timestamp}\n`;
         fs.appendFileSync(REPORTS_LOG, csvLine);
-        console.log(`  [Log] Guardado en reports.csv`);
+        console.log(`  [Log] Guardado en reports.csv (${reportType})`);
 
         const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}. #${result.solicitudNumber}\n${solicitudUrl}`;
         await chat.sendMessage(successMsg, { mentions });
@@ -1410,25 +1419,38 @@ Respondé SOLO con la dirección limpia, nada más.`,
   }
 
   // Load already processed solicitudes from CSV with timestamps
+  // Returns Map with key "normalized_address|reportType" -> { timestamp, solicitudNumber }
   getProcessedSolicitudes() {
-    const processed = new Map(); // address -> { timestamp, solicitudNumber }
+    const processed = new Map();
     if (fs.existsSync(REPORTS_LOG)) {
       const content = fs.readFileSync(REPORTS_LOG, 'utf-8');
       const lines = content.split('\n').slice(1); // Skip header
       for (const line of lines) {
         if (line.trim()) {
-          // Extract address and timestamp from CSV line
-          // Format: numero,fecha,"direccion",link,timestamp
+          // Extract address from CSV line (handles both old and new format)
+          // Old format: numero,fecha,"direccion",link,timestamp
+          // New format: numero,fecha,"direccion",reportType,link,timestamp
           const addressMatch = line.match(/"([^"]+)"/);
           const parts = line.split(',');
           const timestamp = parseInt(parts[parts.length - 1]) || 0;
           const solicitudNumber = parts[0];
 
           if (addressMatch) {
-            const address = addressMatch[1].toLowerCase();
-            // Keep the most recent entry for each address
-            if (!processed.has(address) || processed.get(address).timestamp < timestamp) {
-              processed.set(address, { timestamp, solicitudNumber });
+            const address = this.normalizeAddressForComparison(addressMatch[1]);
+
+            // Detect format: if part after address is a known reportType, use new format
+            // Find index of closing quote, then check next part
+            const quoteEnd = line.indexOf('"', line.indexOf('"') + 1);
+            const afterAddress = line.substring(quoteEnd + 2).split(',')[0];
+            const knownTypes = ['recoleccion', 'barrido', 'obstruccion', 'ocupacion_comercial', 'ocupacion_gastronomica', 'manteros'];
+            const reportType = knownTypes.includes(afterAddress) ? afterAddress : 'recoleccion';
+
+            // Key: normalized_address|reportType
+            const key = `${address}|${reportType}`;
+
+            // Keep the most recent entry for each address+reportType combo
+            if (!processed.has(key) || processed.get(key).timestamp < timestamp) {
+              processed.set(key, { timestamp, solicitudNumber });
             }
           }
         }
@@ -1461,16 +1483,18 @@ Respondé SOLO con la dirección limpia, nada más.`,
     return normalized;
   }
 
-  // Check if address was submitted in last 24 hours
-  isRecentDuplicate(address, processedMap) {
+  // Check if address+reportType was submitted in last 12 hours
+  isRecentDuplicate(address, reportType, processedMap) {
     const normalizedNew = this.normalizeAddressForComparison(address);
+    const type = reportType || 'recoleccion';
 
-    // Check against all processed addresses (normalized)
-    for (const [storedAddr, entry] of processedMap) {
-      const normalizedStored = this.normalizeAddressForComparison(storedAddr);
-      if (normalizedNew === normalizedStored) {
-        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-        if (entry.timestamp > twentyFourHoursAgo) {
+    // Check against all processed addresses (normalized) with matching reportType
+    for (const [storedKey, entry] of processedMap) {
+      // Key format: "normalized_address|reportType"
+      const [storedAddr, storedType] = storedKey.split('|');
+      if (normalizedNew === storedAddr && type === storedType) {
+        const twelveHoursAgo = Date.now() - (12 * 60 * 60 * 1000);
+        if (entry.timestamp > twelveHoursAgo) {
           return entry;
         }
       }
@@ -1620,10 +1644,10 @@ Respondé SOLO con la dirección limpia, nada más.`,
               console.log(`[Startup] Request sin dirección, ignorando`);
               continue;
             }
-            // Skip if already processed in last 24 hours
-            const recentDupe = this.isRecentDuplicate(req.address, processedAddresses);
+            // Skip if already processed in last 12 hours (per address + report type)
+            const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses);
             if (recentDupe) {
-              console.log(`[Startup] Ya procesado en últimas 24h: ${req.address} (#${recentDupe.solicitudNumber})`);
+              console.log(`[Startup] Ya procesado en últimas 12h: ${req.address} [${req.reportType || 'recoleccion'}] (#${recentDupe.solicitudNumber})`);
               continue;
             }
 
