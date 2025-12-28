@@ -1539,9 +1539,9 @@ Respondé SOLO con la dirección limpia, nada más.`,
         fs.appendFileSync(REPORTS_LOG, csvLine);
         console.log(`  [Log] Guardado en reports.csv (${reportType})`);
 
-        const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}. #${result.solicitudNumber}\n${solicitudUrl}`;
+        const successMsg = `${mentionText} Listo, mandé la solicitud de ${reportTypeName.toLowerCase()} para ${address}. #${result.solicitudNumber}\n${solicitudUrl}`;
         await chat.sendMessage(successMsg, { mentions });
-        console.log(`  [Bot] Solicitud enviada: #${result.solicitudNumber}`);
+        console.log(`  [Bot] Solicitud enviada: #${result.solicitudNumber} (${reportTypeName})`);
 
         // Post to X/Twitter only if user requested it (before cleaning up photo)
         if (shouldPostToX) {
@@ -1569,9 +1569,9 @@ Respondé SOLO con la dirección limpia, nada más.`,
           try { fs.unlinkSync(photo); } catch (e) {}
         }
       } else if (result.success) {
-        const successMsg = `${mentionText} Listo, mandé la solicitud para ${address}.`;
+        const successMsg = `${mentionText} Listo, mandé la solicitud de ${reportTypeName.toLowerCase()} para ${address}.`;
         await chat.sendMessage(successMsg, { mentions });
-        console.log(`  [Bot] Solicitud enviada (sin número)`);
+        console.log(`  [Bot] Solicitud enviada (sin número) (${reportTypeName})`);
 
         // Post to X/Twitter only if user requested it (even without solicitud number)
         if (shouldPostToX) {
