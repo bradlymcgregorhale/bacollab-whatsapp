@@ -457,6 +457,65 @@ class TrashReportBot {
           // Keep waiting for photo
           return;
         }
+      } else if (awaitingField === 'photos' && pendingRequest.reportType === 'vehiculo_mal_estacionado') {
+        // Looking for additional photos for vehicle report
+        const newPhotos = pending.messages.filter(m => m.photo).map(m => m.photo);
+        if (newPhotos.length > 0) {
+          // Combine with existing photos
+          const existingPhotos = pendingRequest.photos || [];
+          pendingRequest.photos = [...existingPhotos, ...newPhotos];
+          console.log(`[Pending Info] Vehicle report now has ${pendingRequest.photos.length} photo(s)`);
+
+          if (pendingRequest.photos.length >= 2) {
+            // We have enough photos now, check for other missing fields
+            if (!pendingRequest.patente) {
+              // Still need patente
+              const patenteQuestion = `No puedo leer la patente en las fotos. ¿Podés decirme cuál es la patente del vehículo? (ej: ABC123 o AB123CD)`;
+              const chat = pendingRequest.chat;
+              const senderInfo = this.senderIdCache?.get(senderId);
+              const mentions = senderInfo ? [senderInfo.senderId] : [];
+              const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+
+              await chat.sendMessage(`${mentionText} ${patenteQuestion}`.trim(), { mentions });
+              pendingRequest.awaitingField = 'patente';
+              pendingRequest.awaitingQuestion = patenteQuestion;
+              pendingMessages.delete(senderId);
+              return;
+            } else if (!pendingRequest.infractionTime) {
+              // Still need time
+              const timeQuestion = `¿A qué hora viste el vehículo mal estacionado en ${pendingRequest.address}? (ej: 14:30)`;
+              const chat = pendingRequest.chat;
+              const senderInfo = this.senderIdCache?.get(senderId);
+              const mentions = senderInfo ? [senderInfo.senderId] : [];
+              const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+
+              await chat.sendMessage(`${mentionText} ${timeQuestion}`.trim(), { mentions });
+              pendingRequest.awaitingField = 'infractionTime';
+              pendingRequest.awaitingQuestion = timeQuestion;
+              pendingMessages.delete(senderId);
+              return;
+            }
+
+            // We have all the info, submit
+            this.pendingInfoRequests.delete(senderId);
+            pendingMessages.delete(senderId);
+            console.log(`[Pending Info] Vehicle report ready with ${pendingRequest.photos.length} photos, submitting`);
+            await this.submitRequest(pendingRequest);
+            return;
+          } else {
+            // Still need more photos
+            const chat = pendingRequest.chat;
+            const senderInfo = this.senderIdCache?.get(senderId);
+            const mentions = senderInfo ? [senderInfo.senderId] : [];
+            const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+
+            await chat.sendMessage(`${mentionText} Necesito una foto más para el reporte. ¿Podés mandar otra donde se vea la patente?`.trim(), { mentions });
+            pendingMessages.delete(senderId);
+            return;
+          }
+        }
+        // No new photos, keep waiting
+        return;
       } else if (awaitingField === 'address' && lastMessage?.text) {
         // Looking for address - extract clean address from user's response
         console.log(`[Pending Info] User provided address response: "${lastMessage.text}"`);
@@ -513,7 +572,10 @@ class TrashReportBot {
           obstruccion: 'obstrucción de vereda',
           ocupacion_comercial: 'ocupación por local comercial',
           ocupacion_gastronomica: 'ocupación gastronómica',
-          manteros: 'vendedores ambulantes'
+          manteros: 'vendedores ambulantes',
+          puesto_diarios: 'irregularidades en puesto de diarios',
+          puesto_flores: 'irregularidades en puesto de flores',
+          vehiculo_mal_estacionado: 'vehículo mal estacionado'
         };
 
         await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${reportLabels[reportType]} en ${pendingRequest.address}...`.trim(), { mentions });
@@ -521,10 +583,55 @@ class TrashReportBot {
         await this.submitRequest(pendingRequest);
         return;
       } else if (lastMessage?.text) {
-        // Generic text response - likely schedule or other info
+        // Generic text response - could be schedule, situationType, patente, infractionTime, or other info
         console.log(`[Pending Info] User responded: "${lastMessage.text}"`);
 
-        if (awaitingField === 'schedule' || pendingRequest.awaitingQuestion?.includes('horario') || pendingRequest.awaitingQuestion?.includes('días')) {
+        if (awaitingField === 'situationType' || pendingRequest.awaitingQuestion?.includes('Obstruye') || pendingRequest.awaitingQuestion?.includes('abandonado')) {
+          // Extract situation type from user response
+          const responseText = lastMessage.text.toLowerCase();
+          let situationType = null;
+          if (responseText.includes('obstruy') || responseText.includes('tapa') || responseText.includes('bloquea') || responseText.includes('no se puede pasar')) {
+            situationType = 'obstruccion';
+          } else if (responseText.includes('abandon') || responseText.includes('cerrad') || responseText.includes('vací') || responseText.includes('obsolet')) {
+            situationType = 'abandono';
+          } else if (responseText.includes('deterior') || responseText.includes('rot') || responseText.includes('dañ') || responseText.includes('mal estado')) {
+            situationType = 'deterioro';
+          } else {
+            // Default to obstruccion if unclear
+            situationType = 'obstruccion';
+          }
+          pendingRequest.situationType = situationType;
+          console.log(`[Pending Info] Set situationType: "${situationType}" from "${lastMessage.text}"`);
+        } else if (awaitingField === 'patente') {
+          // Extract patente from user response (format: ABC123 or AB123CD, max 7 chars)
+          const patenteMatch = lastMessage.text.toUpperCase().match(/[A-Z0-9]{6,7}/);
+          if (patenteMatch) {
+            pendingRequest.patente = patenteMatch[0];
+            console.log(`[Pending Info] Set patente: "${pendingRequest.patente}" from "${lastMessage.text}"`);
+          } else {
+            // Use the text as-is if it looks like a patente
+            pendingRequest.patente = lastMessage.text.toUpperCase().replace(/\s/g, '').substring(0, 7);
+            console.log(`[Pending Info] Set patente (raw): "${pendingRequest.patente}" from "${lastMessage.text}"`);
+          }
+        } else if (awaitingField === 'infractionTime') {
+          // Extract time from user response (format: HH:MM)
+          const timeMatch = lastMessage.text.match(/(\d{1,2})[:\.]?(\d{2})?/);
+          if (timeMatch) {
+            const hours = timeMatch[1].padStart(2, '0');
+            const minutes = timeMatch[2] ? timeMatch[2] : '00';
+            pendingRequest.infractionTime = `${hours}:${minutes}`;
+            console.log(`[Pending Info] Set infractionTime: "${pendingRequest.infractionTime}" from "${lastMessage.text}"`);
+          } else if (lastMessage.text.toLowerCase().includes('ahora') || lastMessage.text.toLowerCase().includes('recién')) {
+            // Use current time
+            const now = new Date();
+            pendingRequest.infractionTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+            console.log(`[Pending Info] Set infractionTime (now): "${pendingRequest.infractionTime}"`);
+          } else {
+            // Use raw text
+            pendingRequest.infractionTime = lastMessage.text;
+            console.log(`[Pending Info] Set infractionTime (raw): "${pendingRequest.infractionTime}"`);
+          }
+        } else if (awaitingField === 'schedule' || pendingRequest.awaitingQuestion?.includes('horario') || pendingRequest.awaitingQuestion?.includes('días')) {
           pendingRequest.schedule = lastMessage.text;
           console.log(`[Pending Info] Set schedule: "${lastMessage.text}"`);
         } else {
@@ -535,7 +642,7 @@ class TrashReportBot {
         this.pendingInfoRequests.delete(senderId);
         pendingMessages.delete(senderId);
 
-        console.log(`[Pending Info] Resubmitting with: schedule="${pendingRequest.schedule}", reportType="${pendingRequest.reportType || 'not set'}"`);
+        console.log(`[Pending Info] Resubmitting with: schedule="${pendingRequest.schedule || 'none'}", situationType="${pendingRequest.situationType || 'none'}", patente="${pendingRequest.patente || 'none'}", infractionTime="${pendingRequest.infractionTime || 'none'}", reportType="${pendingRequest.reportType || 'not set'}"`);
         await this.submitRequest(pendingRequest);
         return;
       }
@@ -689,6 +796,10 @@ class TrashReportBot {
         };
 
         const needsSchedule = []; // Manteros requests that need schedule info
+        const needsSituationType = []; // Puesto requests that need situation type
+        const needsVehicleInfo = []; // Vehicle requests that need patente or infractionTime
+        const photoCount = pending.messages.filter(m => m.photo).length;
+
         for (const req of extraction.requests) {
           // Validate address first
           if (!isValidAddress(req.address)) {
@@ -703,6 +814,23 @@ class TrashReportBot {
           } else if (req.reportType === 'manteros' && (!req.schedule || req.schedule === 'No especificado')) {
             // Manteros requests need a schedule - ask for it instead of queueing
             needsSchedule.push(req);
+          } else if ((req.reportType === 'puesto_diarios' || req.reportType === 'puesto_flores') && !req.situationType) {
+            // Puesto requests need a situation type - ask for it instead of queueing
+            needsSituationType.push(req);
+          } else if (req.reportType === 'vehiculo_mal_estacionado') {
+            // Vehicle reports need: 2 photos, patente, and infractionTime
+            if (photoCount < 2) {
+              console.log(`  [Vehicle] Only ${photoCount} photo(s), need 2`);
+              needsVehicleInfo.push({ ...req, missingField: 'photos' });
+            } else if (!req.patente) {
+              console.log(`  [Vehicle] Missing patente`);
+              needsVehicleInfo.push({ ...req, missingField: 'patente' });
+            } else if (!req.infractionTime) {
+              console.log(`  [Vehicle] Missing infractionTime`);
+              needsVehicleInfo.push({ ...req, missingField: 'infractionTime' });
+            } else {
+              newRequests.push(req);
+            }
           } else {
             newRequests.push(req);
           }
@@ -743,6 +871,87 @@ class TrashReportBot {
           return;
         }
 
+        // Handle puesto_diarios/puesto_flores requests that need situation type
+        if (needsSituationType.length > 0 && newRequests.length === 0 && duplicates.length === 0) {
+          const req = needsSituationType[0]; // Handle first one
+          const photoMsg = pending.messages.find(m => m.photo);
+          const photo = photoMsg?.photo || null;
+          const typeLabel = req.reportType === 'puesto_diarios' ? 'puesto de diarios' : 'puesto de flores';
+          const situationQuestion = `¿Cuál es el problema con el ${typeLabel} en ${req.address}? ¿Obstruye la vereda, está abandonado, o está deteriorado?`;
+
+          // Quote the photo message if available
+          const msgToQuote = photoMsg || pending.messages[pending.messages.length - 1];
+          const quoteOptions = msgToQuote?.msgId
+            ? { mentions, quotedMessageId: msgToQuote.msgId }
+            : { mentions };
+
+          console.log(`  [Puesto] Need situationType for ${req.address}, asking user...`);
+          await chat.sendMessage(`${mentionText} ${situationQuestion}`.trim(), quoteOptions);
+
+          // Save as pending info request awaiting situationType
+          if (!this.pendingInfoRequests) {
+            this.pendingInfoRequests = new Map();
+          }
+          this.pendingInfoRequests.set(senderId, {
+            senderId,
+            senderName: pending.senderName,
+            address: req.address,
+            photo,
+            chat,
+            reportType: req.reportType,
+            awaitingField: 'situationType',
+            awaitingQuestion: situationQuestion
+          });
+
+          pendingMessages.delete(senderId);
+          return;
+        }
+
+        // Handle vehiculo_mal_estacionado requests that need info
+        if (needsVehicleInfo.length > 0 && newRequests.length === 0 && duplicates.length === 0) {
+          const req = needsVehicleInfo[0]; // Handle first one
+          const allPhotos = pending.messages.filter(m => m.photo).map(m => m.photo);
+          const photoMsg = pending.messages.find(m => m.photo);
+          let question = '';
+
+          if (req.missingField === 'photos') {
+            question = `Para reportar un vehículo mal estacionado necesito dos fotos: una de la infracción y otra de la patente. ¿Podés mandar la otra foto?`;
+          } else if (req.missingField === 'patente') {
+            question = `No puedo leer la patente en las fotos. ¿Podés decirme cuál es la patente del vehículo? (ej: ABC123 o AB123CD)`;
+          } else if (req.missingField === 'infractionTime') {
+            question = `¿A qué hora viste el vehículo mal estacionado en ${req.address}? (ej: 14:30)`;
+          }
+
+          // Quote the photo message if available
+          const msgToQuote = photoMsg || pending.messages[pending.messages.length - 1];
+          const quoteOptions = msgToQuote?.msgId
+            ? { mentions, quotedMessageId: msgToQuote.msgId }
+            : { mentions };
+
+          console.log(`  [Vehicle] Need ${req.missingField} for ${req.address}, asking user...`);
+          await chat.sendMessage(`${mentionText} ${question}`.trim(), quoteOptions);
+
+          // Save as pending info request
+          if (!this.pendingInfoRequests) {
+            this.pendingInfoRequests = new Map();
+          }
+          this.pendingInfoRequests.set(senderId, {
+            senderId,
+            senderName: pending.senderName,
+            address: req.address,
+            photos: allPhotos,
+            chat,
+            reportType: 'vehiculo_mal_estacionado',
+            patente: req.patente || null,
+            infractionTime: req.infractionTime || null,
+            awaitingField: req.missingField,
+            awaitingQuestion: question
+          });
+
+          pendingMessages.delete(senderId);
+          return;
+        }
+
         // Notify about duplicates
         if (duplicates.length > 0) {
           const reportLabelsForDupe = {
@@ -751,7 +960,10 @@ class TrashReportBot {
             obstruccion: 'obstrucción',
             ocupacion_comercial: 'ocupación comercial',
             ocupacion_gastronomica: 'ocupación gastronómica',
-            manteros: 'manteros'
+            manteros: 'manteros',
+            puesto_diarios: 'puesto de diarios',
+            puesto_flores: 'puesto de flores',
+            vehiculo_mal_estacionado: 'vehículo mal estacionado'
           };
           for (const dupe of duplicates) {
             const dupeUrl = `https://bacolaborativa.buenosaires.gob.ar/detalleSolicitud/${dupe.solicitudNumber.replace(/\//g, '&')}?vieneDeMisSolicitudes=false`;
@@ -773,7 +985,10 @@ class TrashReportBot {
             obstruccion: 'obstrucción de vereda',
             ocupacion_comercial: 'ocupación por local comercial',
             ocupacion_gastronomica: 'ocupación gastronómica',
-            manteros: 'vendedores ambulantes'
+            manteros: 'vendedores ambulantes',
+            puesto_diarios: 'irregularidades en puesto de diarios',
+            puesto_flores: 'irregularidades en puesto de flores',
+            vehiculo_mal_estacionado: 'vehículo mal estacionado'
           };
           const requestDescriptions = newRequests.map(r => {
             const addr = r.address;
@@ -803,6 +1018,14 @@ class TrashReportBot {
             }
 
             let photo = null;
+            let photos = null; // For vehiculo_mal_estacionado: collect ALL photos
+
+            // For vehiculo_mal_estacionado, collect ALL photos from the messages
+            if (req.reportType === 'vehiculo_mal_estacionado') {
+              photos = pending.messages.filter(m => m.photo).map(m => m.photo);
+              console.log(`  [Vehicle] Collected ${photos.length} photo(s) for vehicle report`);
+            }
+
             // Use msgIndex if provided (1-indexed)
             if (req.msgIndex && pending.messages[req.msgIndex - 1]?.photo) {
               photo = pending.messages[req.msgIndex - 1].photo;
@@ -825,7 +1048,11 @@ class TrashReportBot {
               reportType: req.reportType || 'recoleccion',
               containerType: req.containerType || 'negro',
               schedule: req.schedule || null, // For manteros: days/times
+              situationType: req.situationType || null, // For puesto_diarios/puesto_flores: obstruccion/abandono/deterioro
+              patente: req.patente || null, // For vehiculo_mal_estacionado: license plate
+              infractionTime: req.infractionTime || null, // For vehiculo_mal_estacionado: time of infraction
               photo,
+              photos, // For vehiculo_mal_estacionado: all photos
               chat,
               postToX: shouldPostToX
             });
@@ -1051,7 +1278,10 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) NUEVA(s) - analizalas. Cada foto
                     obstruccion: 'obstrucción en vereda',
                     ocupacion_comercial: 'ocupación por comercio',
                     ocupacion_gastronomica: 'ocupación gastronómica',
-                    manteros: 'vendedores ambulantes/manteros'
+                    manteros: 'vendedores ambulantes/manteros',
+                    puesto_diarios: 'puesto de diarios con irregularidades',
+                    puesto_flores: 'puesto de flores con irregularidades',
+                    vehiculo_mal_estacionado: 'vehículo mal estacionado'
                   };
 
                   for (const m of messagesToProcess) {
@@ -1169,16 +1399,19 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) NUEVA(s) - analizalas. Cada foto
 - ocupacion_comercial: local/negocio/kiosco/comercio poniendo cosas en la vereda, ocupación indebida
 - ocupacion_gastronomica: restaurant/bar/café con mesas en la vereda
 - manteros: vendedores ambulantes, manteros, venta ilegal en la calle
+- puesto_diarios: kiosco de diarios, puesto de periódicos, diarios
+- puesto_flores: puesto de flores, florería, plantas
+- vehiculo_mal_estacionado: auto mal estacionado, vehículo en la vereda, estacionamiento indebido, doble fila, auto en rampa
 
 IMPORTANTE: Si el usuario dice "NO es X" o "no manteros", entonces NO es ese tipo.
 Si dice "local" u "ocupación indebida" → ocupacion_comercial
 
-Respondé SOLO con una de estas palabras: recoleccion, barrido, obstruccion, ocupacion_comercial, ocupacion_gastronomica, manteros`,
+Respondé SOLO con una de estas palabras: recoleccion, barrido, obstruccion, ocupacion_comercial, ocupacion_gastronomica, manteros, puesto_diarios, puesto_flores, vehiculo_mal_estacionado`,
         messages: [{ role: 'user', content: rawText }]
       });
 
       const result = response.content[0].text.trim().toLowerCase();
-      const validTypes = ['recoleccion', 'barrido', 'obstruccion', 'ocupacion_comercial', 'ocupacion_gastronomica', 'manteros'];
+      const validTypes = ['recoleccion', 'barrido', 'obstruccion', 'ocupacion_comercial', 'ocupacion_gastronomica', 'manteros', 'puesto_diarios', 'puesto_flores', 'vehiculo_mal_estacionado'];
 
       if (validTypes.includes(result)) {
         console.log(`  [ReportType] Extracted: "${rawText}" → "${result}"`);
@@ -1234,7 +1467,7 @@ Respondé SOLO con la dirección limpia, nada más.`,
   }
 
   async submitRequest(request, isRetry = false) {
-    const { senderId, senderName, address, reportType = 'recoleccion', containerType, schedule, photo, chat, postToX: shouldPostToX } = request;
+    const { senderId, senderName, address, reportType = 'recoleccion', containerType, schedule, situationType, patente, infractionTime, photo, photos: multiplePhotos, chat, postToX: shouldPostToX } = request;
     const senderInfo = this.senderIdCache?.get(senderId);
     const mentions = senderInfo ? [senderInfo.senderId] : [senderId];
     const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : `@${senderId.split('@')[0]}`;
@@ -1245,7 +1478,10 @@ Respondé SOLO con la dirección limpia, nada más.`,
       obstruccion: 'Obstrucción de calle/vereda',
       ocupacion_comercial: 'Ocupación por local comercial',
       ocupacion_gastronomica: 'Ocupación por área gastronómica',
-      manteros: 'Manteros/vendedores ambulantes'
+      manteros: 'Manteros/vendedores ambulantes',
+      puesto_diarios: 'Irregularidades en puesto de diarios',
+      puesto_flores: 'Irregularidades en puesto de flores',
+      vehiculo_mal_estacionado: 'Vehículo mal estacionado'
     };
     const reportTypeName = REPORT_TYPE_LABELS[reportType] || 'Recolección de residuos';
 
@@ -1261,10 +1497,19 @@ Respondé SOLO con la dirección limpia, nada más.`,
     if (reportType === 'manteros' && schedule) {
       console.log(`  Horario: ${schedule}`);
     }
+    if ((reportType === 'puesto_diarios' || reportType === 'puesto_flores') && request.situationType) {
+      console.log(`  Situación: ${request.situationType}`);
+    }
+    if (reportType === 'vehiculo_mal_estacionado') {
+      if (request.patente) console.log(`  Patente: ${request.patente}`);
+      if (request.infractionTime) console.log(`  Hora infracción: ${request.infractionTime}`);
+    }
     console.log('========================================\n');
 
     try {
       // Call the API
+      // For vehiculo_mal_estacionado, use multiplePhotos if available
+      const photosToSend = multiplePhotos && multiplePhotos.length > 0 ? multiplePhotos : (photo ? [photo] : []);
       const response = await fetch(`${API_URL}/solicitud`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1273,7 +1518,10 @@ Respondé SOLO con la dirección limpia, nada más.`,
           reportType,
           containerType,
           schedule, // For manteros: days/times when vendors are present
-          photos: photo ? [photo] : []
+          situationType, // For puesto_diarios/puesto_flores: obstruccion/abandono/deterioro
+          patente, // For vehiculo_mal_estacionado: license plate
+          infractionTime, // For vehiculo_mal_estacionado: time of infraction (HH:MM)
+          photos: photosToSend
         })
       });
 

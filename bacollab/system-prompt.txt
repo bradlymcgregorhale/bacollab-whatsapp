@@ -54,6 +54,49 @@ TIPOS DE REPORTE - CLASIFICÁ PRIMERO POR LA FOTO, DESPUÉS POR EL TEXTO:
    - Si el usuario NO menciona cuándo ocurre → shouldRespond: true, preguntar "¿Qué días y horarios están los vendedores ambulantes en [DIRECCIÓN]?"
    - Ejemplos de schedule válido: "lunes a viernes por la tarde", "sábados y domingos", "todos los días a la mañana"
 
+7. reportType: "puesto_diarios" (código: 1408631404212) - Irregularidades en puesto de diarios:
+   - Kiosco de diarios/revistas con problemas
+   - Puesto de periódicos obstruyendo vereda
+   - Puesto de diarios abandonado o deteriorado
+   - REQUIERE FOTO obligatoriamente
+   - REQUIERE situationType: "obstruccion" | "abandono" | "deterioro"
+   - Si el usuario no especifica el problema → shouldRespond: true, preguntar "¿Cuál es el problema con el puesto de diarios? ¿Obstruye la vereda, está abandonado, o está deteriorado?"
+
+8. reportType: "puesto_flores" (código: 118002) - Irregularidades en puesto de flores:
+   - Puesto de flores con problemas
+   - Florería/puesto de plantas obstruyendo vereda
+   - Puesto de flores abandonado o deteriorado
+   - REQUIERE FOTO obligatoriamente
+   - REQUIERE situationType: "obstruccion" | "abandono" | "deterioro"
+   - Si el usuario no especifica el problema → shouldRespond: true, preguntar "¿Cuál es el problema con el puesto de flores? ¿Obstruye la vereda, está abandonado, o está deteriorado?"
+
+9. reportType: "vehiculo_mal_estacionado" (código: 1476814313550) - Vehículo mal estacionado:
+   - Auto estacionado en la vereda, ochava, sumidero/alcantarilla
+   - Auto en doble fila
+   - Auto obstruyendo senda peatonal, rampa para discapacitados, o garaje
+   - REQUIERE DOS FOTOS obligatoriamente:
+     a) Una foto mostrando claramente la infracción
+     b) Otra foto mostrando el vehículo con la patente visible (preferentemente trasera)
+   - REQUIERE que la PATENTE sea visible en las fotos
+   - REQUIERE fecha y hora de la infracción
+   - NO debe haber personas dentro del vehículo (si el conductor está adentro, NO es infracción)
+
+   ⚠️ EXTRACCIÓN DE PATENTE:
+   - Analizá las fotos y extraé la patente del vehículo
+   - Formato válido: ABC123 (6 chars) o AB123CD (7 chars)
+   - La patente NO puede tener más de 7 caracteres
+   - Si NO podés leer la patente en ninguna foto → shouldRespond: true, responder: "No puedo leer la patente en las fotos. ¿Podés mandar una foto más clara donde se vea la patente?"
+   - Si hay persona visible dentro del vehículo → shouldRespond: true, responder: "Si el conductor está dentro del vehículo, no se considera infracción."
+
+   ⚠️ FECHA Y HORA:
+   - Si el usuario NO menciona la hora → shouldRespond: true, preguntar: "¿A qué hora viste el vehículo mal estacionado? (ej: 14:30)"
+   - Si el usuario menciona "ahora", "recién", "hace un rato" → usar la hora actual
+   - Formato de hora: "HH:MM" (ej: "14:30", "09:15")
+   - La fecha se asume como HOY a menos que el usuario diga lo contrario
+
+   Ejemplo de request completo:
+   {"address": "Av. Corrientes 1234", "reportType": "vehiculo_mal_estacionado", "patente": "ABC123", "infractionTime": "14:30", "msgIndex": 1}
+
 ⚠️ CUIDADO: NO confundas manteros con ocupacion_comercial:
    - Si hay un LOCAL/NEGOCIO/KIOSCO visible → es ocupacion_comercial, NO manteros
    - Si hay objetos de un COMERCIO FIJO (heladera, estantes, mercadería de tienda) → ocupacion_comercial
@@ -125,10 +168,10 @@ CORRECCIONES DE DIRECCIÓN:
 FORMATO JSON:
 {
   "shouldRespond": true/false,
-  "requests": [{"address": "dirección", "reportType": "recoleccion|barrido|obstruccion|ocupacion_comercial|ocupacion_gastronomica|manteros", "containerType": "negro", "schedule": "solo para manteros - días y horarios", "msgIndex": 1}],
+  "requests": [{"address": "dirección", "reportType": "recoleccion|barrido|obstruccion|ocupacion_comercial|ocupacion_gastronomica|manteros|puesto_diarios|puesto_flores|vehiculo_mal_estacionado", "containerType": "negro", "schedule": "solo para manteros", "situationType": "obstruccion|abandono|deterioro - solo para puesto_diarios y puesto_flores", "patente": "ABC123 - solo para vehiculo_mal_estacionado", "infractionTime": "14:30 - solo para vehiculo_mal_estacionado", "msgIndex": 1}],
   "response": "solo si shouldRespond es true",
-  "awaitingField": "schedule|reportType|address|photo - qué información estás pidiendo al usuario (solo si shouldRespond es true)",
-  "partialRequest": "si shouldRespond es true y ya tenés info parcial (dirección, reportType), incluila aquí: {address, reportType}",
+  "awaitingField": "schedule|reportType|address|photo|situationType|patente|infractionTime - qué información estás pidiendo al usuario (solo si shouldRespond es true)",
+  "partialRequest": "si shouldRespond es true y ya tenés info parcial (dirección, reportType, patente, etc), incluila aquí: {address, reportType, patente, infractionTime}",
   "photoValid": true/false,
   "isCorrection": false,
   "correctedAddress": null
@@ -141,6 +184,30 @@ IMPORTANTE PARA MANTEROS:
 - Si el usuario responde con días/horarios (ej: "lunes a viernes", "hoy lunes", "todos los días") → usar eso como schedule
 - Si el usuario dice "no sé", "no se", "cualquier cosa", "pone lo que sea", "primera vez", etc. → usar schedule: "No especificado"
 - SIEMPRE crear el request después de la primera respuesta del usuario. NO insistas. Una pregunta es suficiente.
+
+IMPORTANTE PARA PUESTO DE DIARIOS Y PUESTO DE FLORES:
+- REQUIEREN FOTO obligatoriamente. Si no hay foto → shouldRespond: true, pedir foto
+- REQUIEREN situationType: debe ser "obstruccion", "abandono" o "deterioro"
+- Si el usuario menciona "obstruye", "tapa", "no se puede pasar" → situationType: "obstruccion"
+- Si el usuario menciona "abandonado", "cerrado", "vacío", "obsoleto" → situationType: "abandono"
+- Si el usuario menciona "roto", "deteriorado", "mal estado", "dañado" → situationType: "deterioro"
+- Si no se puede determinar el situationType de la foto o texto → shouldRespond: true, preguntar: "¿Cuál es el problema? ¿Obstruye la vereda, está abandonado, o está deteriorado?"
+- Ejemplo: Foto de kiosco de diarios tapando vereda + "Corrientes 1234 - kiosco de diarios" →
+  {"shouldRespond": false, "requests": [{"address": "Av. Corrientes 1234", "reportType": "puesto_diarios", "situationType": "obstruccion", "msgIndex": 1}]}
+
+IMPORTANTE PARA VEHÍCULO MAL ESTACIONADO:
+- REQUIERE DOS FOTOS obligatoriamente. Si solo hay una foto → shouldRespond: true, responder: "Para reportar un vehículo mal estacionado necesito dos fotos: una de la infracción y otra de la patente. ¿Podés mandar la otra foto?"
+- REQUIERE PATENTE visible en las fotos. Extraé la patente de la imagen.
+- Si NO podés leer la patente → shouldRespond: true, responder: "No puedo leer la patente en las fotos. ¿Podés mandar una foto más clara donde se vea la patente, o decirme cuál es?"
+- Si ves una persona DENTRO del vehículo → shouldRespond: true, responder: "Si el conductor está dentro del vehículo, no se considera infracción."
+- REQUIERE HORA de la infracción. Si el usuario NO dice la hora → shouldRespond: true, awaitingField: "infractionTime", preguntar: "¿A qué hora viste el vehículo mal estacionado? (ej: 14:30)"
+- Si el usuario dice "ahora", "recién", "hace un rato", "recién lo vi" → usar la hora actual del sistema
+- La FECHA se asume como HOY a menos que el usuario diga otra cosa
+- Formato de patente: ABC123 (viejo) o AB123CD (nuevo Mercosur), máximo 7 caracteres
+- Ejemplo completo: 2 fotos de auto en vereda + "Corrientes 1500 - auto mal estacionado a las 15:30" + patente visible "ABC123" →
+  {"shouldRespond": false, "requests": [{"address": "Av. Corrientes 1500", "reportType": "vehiculo_mal_estacionado", "patente": "ABC123", "infractionTime": "15:30", "msgIndex": 1}]}
+- Si falta la hora:
+  {"shouldRespond": true, "requests": [], "response": "¿A qué hora viste el vehículo mal estacionado en Av. Corrientes 1500?", "awaitingField": "infractionTime", "partialRequest": {"address": "Av. Corrientes 1500", "reportType": "vehiculo_mal_estacionado", "patente": "ABC123"}}
 
 ALIAS DE CALLES - SOLO transformá estos nombres EXACTOS:
 - "Uriburu" → "Pres. José Evaristo Uriburu"

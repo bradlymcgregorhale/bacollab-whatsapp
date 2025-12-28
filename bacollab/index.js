@@ -65,6 +65,9 @@ const URLS = {
   ocupacion_comercial: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/118001',
   ocupacion_gastronomica: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1604407880652',
   manteros: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1334597891562',
+  puesto_diarios: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1408631404212',
+  puesto_flores: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/118002',
+  vehiculo_mal_estacionado: 'https://bacolaborativa.buenosaires.gob.ar/confirmacion/1476814313550',
   ubicacion: 'https://bacolaborativa.buenosaires.gob.ar/ubicacion'
 };
 
@@ -75,7 +78,10 @@ const REPORT_TYPE_LABELS = {
   obstruccion: 'Obstrucción de calle/vereda',
   ocupacion_comercial: 'Ocupación por local comercial',
   ocupacion_gastronomica: 'Ocupación por área gastronómica',
-  manteros: 'Manteros/vendedores ambulantes'
+  manteros: 'Manteros/vendedores ambulantes',
+  puesto_diarios: 'Irregularidades en puesto de diarios',
+  puesto_flores: 'Irregularidades en puesto de flores',
+  vehiculo_mal_estacionado: 'Vehículo mal estacionado'
 };
 
 const SELECTORS = {
@@ -92,6 +98,10 @@ const SELECTORS = {
   // Form selectors
   radioContenedorVerde: '#respuesta45731',
   radioContenedorNegro: '#respuesta45732',
+  // Puesto diarios/flores situation type selectors
+  radioObstruccion: '#respuesta29113',
+  radioAbandono: '#respuesta29114',
+  radioDeterioro: '#respuesta29115',
   siguienteButton: 'button.btn-primary',
   confirmarFinalButton: 'button.btn-primary'
 };
@@ -268,7 +278,7 @@ async function inspectAllAccordions(page) {
 
 // Intelligent form filling - THINK about what's on screen and act
 async function analyzeAndFillForm(page, availableData) {
-  const { reportType, address, schedule, containerType, hasPhoto } = availableData;
+  const { reportType, address, schedule, containerType, hasPhoto, situationType, patente, infractionTime } = availableData;
 
   // THINK: What's currently visible on the page?
   const formContext = await page.evaluate(() => {
@@ -280,6 +290,14 @@ async function analyzeAndFillForm(page, availableData) {
     const radioInputs = questionnaireAccordion.querySelectorAll('input[type="radio"]');
     const allLabels = Array.from(questionnaireAccordion.querySelectorAll('label')).map(l => l.textContent.trim());
     const buttons = questionnaireAccordion.querySelectorAll('button');
+
+    // Check for date input (for vehiculo_mal_estacionado)
+    const dateInput = questionnaireAccordion.querySelector('input[type="date"]');
+
+    // Check for time picker (for vehiculo_mal_estacionado)
+    const timePicker = questionnaireAccordion.querySelector('ngb-timepicker');
+    const hourInput = timePicker?.querySelector('.ngb-tp-hour input');
+    const minuteInput = timePicker?.querySelector('.ngb-tp-minute input');
 
     // Is there an enabled Siguiente button?
     let siguienteBtn = null;
@@ -321,7 +339,13 @@ async function analyzeAndFillForm(page, availableData) {
       questionLabel,
       hasSiguiente: !!siguienteBtn,
       siguienteDisabled,
-      fullText: questionnaireAccordion.innerText.substring(0, 500)
+      fullText: questionnaireAccordion.innerText.substring(0, 500),
+      // Vehicle report specific
+      hasDateInput: !!dateInput,
+      dateInputValue: dateInput?.value || '',
+      hasTimePicker: !!timePicker,
+      hourInputValue: hourInput?.value || '',
+      minuteInputValue: minuteInput?.value || ''
     };
   });
 
@@ -347,8 +371,74 @@ async function analyzeAndFillForm(page, availableData) {
     };
   }
 
-  // Case 1: There's an empty textarea asking for days/hours
-  if (formContext.hasTextarea && formContext.textareaEmpty) {
+  // Case 0b: Puesto diarios/flores situation type question
+  const isSituationQuestion = formContext.questionLabel.toLowerCase().includes('situación') ||
+                              formContext.questionLabel.toLowerCase().includes('detectaste');
+  if (isSituationQuestion && formContext.hasRadio && !formContext.radioSelected && situationType) {
+    console.log(`[Form AI] DECISION: Situation type question detected, selecting "${situationType}"`);
+    // Map situationType to the correct label text
+    let targetLabel;
+    switch (situationType) {
+      case 'obstruccion':
+        targetLabel = 'Obstrucción';
+        break;
+      case 'abandono':
+        targetLabel = 'abandono';
+        break;
+      case 'deterioro':
+        targetLabel = 'Deterioro';
+        break;
+      default:
+        targetLabel = 'Obstrucción'; // Default
+    }
+    return {
+      action: 'click_radio_by_text',
+      value: targetLabel,
+      then: 'click_siguiente'
+    };
+  }
+
+  // Case 0c: Vehicle patente question - textarea asking for license plate
+  const isPatenteQuestion = formContext.questionLabel.toLowerCase().includes('patente') ||
+                            formContext.questionLabel.toLowerCase().includes('chapa') ||
+                            formContext.fullText.toLowerCase().includes('patente del vehículo');
+  if (isPatenteQuestion && formContext.hasTextarea && formContext.textareaEmpty && patente) {
+    console.log(`[Form AI] DECISION: Patente question detected, filling with "${patente}"`);
+    return {
+      action: 'fill_textarea',
+      value: patente,
+      then: 'click_siguiente'
+    };
+  }
+
+  // Case 0d: Vehicle date input question
+  if (formContext.hasDateInput && !formContext.dateInputValue) {
+    // Use today's date in YYYY-MM-DD format for the input
+    const today = new Date();
+    const dateValue = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+    console.log(`[Form AI] DECISION: Date input detected, filling with today: ${dateValue}`);
+    return {
+      action: 'fill_date',
+      value: dateValue,
+      then: 'click_siguiente'
+    };
+  }
+
+  // Case 0e: Vehicle time picker question
+  if (formContext.hasTimePicker && (!formContext.hourInputValue || !formContext.minuteInputValue) && infractionTime) {
+    // Parse time from infractionTime (format: "HH:MM")
+    const [hours, minutes] = infractionTime.split(':');
+    console.log(`[Form AI] DECISION: Time picker detected, filling with ${hours}:${minutes}`);
+    return {
+      action: 'fill_time',
+      hours: hours || '12',
+      minutes: minutes || '00',
+      then: 'click_siguiente'
+    };
+  }
+
+  // Case 1: There's an empty textarea asking for days/hours (for manteros schedule, not patente)
+  if (formContext.hasTextarea && formContext.textareaEmpty && !isPatenteQuestion) {
     console.log('[Form AI] DECISION: Fill textarea with schedule');
     return {
       action: 'fill_textarea',
@@ -483,6 +573,42 @@ async function executeFormAction(page, action) {
     } else {
       console.log('[Form Execute] Could not find radio with text:', action.value);
     }
+  }
+
+  // Handle fill_date for vehicle report date input
+  if (action.action === 'fill_date') {
+    await page.evaluate((dateValue) => {
+      const dateInput = document.querySelector('#collapseCuestionario.show input[type="date"]');
+      if (dateInput) {
+        dateInput.value = dateValue;
+        dateInput.dispatchEvent(new Event('input', { bubbles: true }));
+        dateInput.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, action.value);
+    console.log('[Form Execute] Filled date input with:', action.value);
+  }
+
+  // Handle fill_time for vehicle report time picker
+  if (action.action === 'fill_time') {
+    await page.evaluate(({ hours, minutes }) => {
+      const timePicker = document.querySelector('#collapseCuestionario.show ngb-timepicker');
+      if (timePicker) {
+        const hourInput = timePicker.querySelector('.ngb-tp-hour input');
+        const minuteInput = timePicker.querySelector('.ngb-tp-minute input');
+
+        if (hourInput) {
+          hourInput.value = hours;
+          hourInput.dispatchEvent(new Event('input', { bubbles: true }));
+          hourInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        if (minuteInput) {
+          minuteInput.value = minutes;
+          minuteInput.dispatchEvent(new Event('input', { bubbles: true }));
+          minuteInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    }, { hours: action.hours, minutes: action.minutes });
+    console.log('[Form Execute] Filled time picker with:', action.hours + ':' + action.minutes);
   }
 
   // Wait for Angular to update
@@ -658,7 +784,7 @@ async function login() {
 }
 
 async function submitSolicitud(data) {
-  const { address, containerType = 'negro', description = '', reportType = 'recoleccion', schedule = null } = data;
+  const { address, containerType = 'negro', description = '', reportType = 'recoleccion', schedule = null, situationType = null, patente = null, infractionTime = null } = data;
 
   if (!isLoggedIn) {
     const loginSuccess = await login();
@@ -675,6 +801,10 @@ async function submitSolicitud(data) {
 
   console.log(`Submitting solicitud for address: ${address}`);
   console.log(`Report type: ${reportTypeName}`);
+  if (reportType === 'vehiculo_mal_estacionado') {
+    console.log(`Patente: ${patente || 'not provided'}`);
+    console.log(`Infraction time: ${infractionTime || 'not provided'}`);
+  }
 
   // Step 1: Go to confirmation page for the appropriate report type
   console.log(`Step 1: Navigating to ${reportTypeName} page...`);
@@ -985,7 +1115,10 @@ async function submitSolicitud(data) {
     address,
     schedule: schedule || 'No especificado',
     containerType: containerType || 'negro',
-    hasPhoto: data.photos && data.photos.length > 0
+    hasPhoto: data.photos && data.photos.length > 0,
+    situationType: situationType || null,
+    patente: patente || null,
+    infractionTime: infractionTime || null
   };
 
   // Keep analyzing and filling questionnaire until done or need_info
@@ -2561,13 +2694,17 @@ function createDedupKey(address, reportType) {
 
 // Submit solicitud endpoint
 app.post('/solicitud', async (req, res) => {
-  const { address, containerType, description, photos, reportType, schedule } = req.body;
+  const { address, containerType, description, photos, reportType, schedule, situationType, patente, infractionTime } = req.body;
 
   if (!address) {
     return res.status(400).json({ success: false, error: 'Address is required' });
   }
 
-  console.log(`API received: address="${address}", reportType="${reportType || 'recoleccion'}"${schedule ? `, schedule="${schedule}"` : ''}`);
+  let logMsg = `API received: address="${address}", reportType="${reportType || 'recoleccion'}"`;
+  if (schedule) logMsg += `, schedule="${schedule}"`;
+  if (patente) logMsg += `, patente="${patente}"`;
+  if (infractionTime) logMsg += `, infractionTime="${infractionTime}"`;
+  console.log(logMsg);
 
   // Deduplication check - prevent submitting same address+reportType twice
   const dedupKey = createDedupKey(address, reportType);
@@ -2611,7 +2748,7 @@ app.post('/solicitud', async (req, res) => {
         console.log(`\n=== RETRY ATTEMPT ${attempt}/${maxAttempts} with fresh browser session ===\n`);
       }
 
-      const result = await submitSolicitud({ address, containerType, description, photos, reportType, schedule });
+      const result = await submitSolicitud({ address, containerType, description, photos, reportType, schedule, situationType, patente, infractionTime });
 
       // Close browser after successful submission
       await closeBrowser();
