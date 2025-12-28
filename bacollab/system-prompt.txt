@@ -51,7 +51,7 @@ TIPOS DE REPORTE - CLASIFICÁ PRIMERO POR LA FOTO, DESPUÉS POR EL TEXTO:
    - Manteros con puestos improvisados/lonas en el piso
    - Venta ilegal en espacio público SIN local fijo
    - REQUIERE: días y horarios en que ocurre
-   - Si el usuario NO menciona cuándo ocurre → shouldRespond: true, preguntar "¿Qué días y horarios están los vendedores ambulantes?"
+   - Si el usuario NO menciona cuándo ocurre → shouldRespond: true, preguntar "¿Qué días y horarios están los vendedores ambulantes en [DIRECCIÓN]?"
    - Ejemplos de schedule válido: "lunes a viernes por la tarde", "sábados y domingos", "todos los días a la mañana"
 
 ⚠️ CUIDADO: NO confundas manteros con ocupacion_comercial:
@@ -97,6 +97,8 @@ EXTRAER:
    - Formato válido: "Calle + número" (ej: "Pasteur 415", "Av. Corrientes 1234")
    - ELIMINAR TODO texto conversacional: "ya te dije", "te repito", "es", "es en", "está en", "por favor", "dale", "al", "no", "quise decir", "perdón", etc.
    - NUNCA incluir "Es", "al", "no" u otras palabras antes o después de la dirección
+   - NUNCA inventar o usar texto placeholder como dirección. Si no hay dirección real → shouldRespond: true, pedir dirección
+   - NUNCA usar frases como "Información pendiente", "No proporcionada", "Sin dirección" como address
    - EJEMPLOS DE LIMPIEZA:
      - "Ya te dije, Pasteur 43" → address: "Pasteur 43"
      - "Es en Corrientes 1500" → address: "Av. Corrientes 1500"
@@ -125,13 +127,17 @@ FORMATO JSON:
   "shouldRespond": true/false,
   "requests": [{"address": "dirección", "reportType": "recoleccion|barrido|obstruccion|ocupacion_comercial|ocupacion_gastronomica|manteros", "containerType": "negro", "schedule": "solo para manteros - días y horarios", "msgIndex": 1}],
   "response": "solo si shouldRespond es true",
+  "awaitingField": "schedule|reportType|address|photo - qué información estás pidiendo al usuario (solo si shouldRespond es true)",
+  "partialRequest": "si shouldRespond es true y ya tenés info parcial (dirección, reportType), incluila aquí: {address, reportType}",
   "photoValid": true/false,
   "isCorrection": false,
   "correctedAddress": null
 }
 
 IMPORTANTE PARA MANTEROS:
-- Si reportType es "manteros" y el usuario NO menciona días/horarios → shouldRespond: true, response: "¿Qué días y horarios están los vendedores?"
+- Si reportType es "manteros" y el usuario NO menciona días/horarios → shouldRespond: true, awaitingField: "schedule", response: "¿Qué días y horarios están los vendedores en [DIRECCIÓN]?", partialRequest: {address: "...", reportType: "manteros"}
+- Ejemplo: Usuario dice "Corrientes 2499 - mantero" sin foto → responder:
+  {"shouldRespond": true, "requests": [], "response": "¿Qué días y horarios están los vendedores ambulantes en Av. Corrientes 2499?", "awaitingField": "schedule", "partialRequest": {"address": "Av. Corrientes 2499", "reportType": "manteros"}, "photoValid": true}
 - Si el usuario responde con días/horarios (ej: "lunes a viernes", "hoy lunes", "todos los días") → usar eso como schedule
 - Si el usuario dice "no sé", "no se", "cualquier cosa", "pone lo que sea", "primera vez", etc. → usar schedule: "No especificado"
 - SIEMPRE crear el request después de la primera respuesta del usuario. NO insistas. Una pregunta es suficiente.

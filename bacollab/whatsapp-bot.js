@@ -277,7 +277,8 @@ class TrashReportBot {
       const messageObj = {
         text: msg.body || null,
         photo: null,
-        timestamp: new Date()
+        timestamp: new Date(),
+        msgId: msg.id._serialized  // Store message ID for quote replies
       };
 
       // Handle photo or video
@@ -476,14 +477,35 @@ class TrashReportBot {
         pendingRequest.reportType = reportType;
         console.log(`[Pending Info] Claude mapped to reportType: ${reportType}`);
 
-        this.pendingInfoRequests.delete(senderId);
-        pendingMessages.delete(senderId);
-
-        // Notify user and queue request
         const chat = pendingRequest.chat;
         const senderInfo = this.senderIdCache?.get(senderId);
         const mentions = senderInfo ? [senderInfo.senderId] : [];
         const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
+
+        // If manteros, we need to ask for schedule before submitting
+        if (reportType === 'manteros' && !pendingRequest.schedule) {
+          const scheduleQuestion = `¿Qué días y horarios están los vendedores ambulantes en ${pendingRequest.address}?`;
+
+          // Try to find and quote the original photo message from history
+          const userHistory = userMessageHistory.get(senderId) || [];
+          const photoMsgToQuote = userHistory.find(m => m.photo && m.photo === pendingRequest.photo);
+          const quoteOptions = photoMsgToQuote?.msgId
+            ? { mentions, quotedMessageId: photoMsgToQuote.msgId }
+            : { mentions };
+
+          console.log(`[Pending Info] Manteros confirmed, now asking for schedule...`);
+          await chat.sendMessage(`${mentionText} ${scheduleQuestion}`.trim(), quoteOptions);
+
+          // Update pending request to now await schedule
+          pendingRequest.awaitingField = 'schedule';
+          pendingRequest.awaitingQuestion = scheduleQuestion;
+          // Keep it in pendingInfoRequests (don't delete)
+          pendingMessages.delete(senderId);
+          return;
+        }
+
+        this.pendingInfoRequests.delete(senderId);
+        pendingMessages.delete(senderId);
 
         const reportLabels = {
           recoleccion: 'recolección de residuos',
@@ -504,6 +526,7 @@ class TrashReportBot {
 
         if (awaitingField === 'schedule' || pendingRequest.awaitingQuestion?.includes('horario') || pendingRequest.awaitingQuestion?.includes('días')) {
           pendingRequest.schedule = lastMessage.text;
+          console.log(`[Pending Info] Set schedule: "${lastMessage.text}"`);
         } else {
           // Default: use as schedule
           pendingRequest.schedule = lastMessage.text;
@@ -512,7 +535,7 @@ class TrashReportBot {
         this.pendingInfoRequests.delete(senderId);
         pendingMessages.delete(senderId);
 
-        console.log(`[Pending Info] Resubmitting with: schedule="${pendingRequest.schedule}"`);
+        console.log(`[Pending Info] Resubmitting with: schedule="${pendingRequest.schedule}", reportType="${pendingRequest.reportType || 'not set'}"`);
         await this.submitRequest(pendingRequest);
         return;
       }
@@ -573,8 +596,16 @@ class TrashReportBot {
           const senderInfo = this.senderIdCache?.get(senderId);
           const mentions = senderInfo ? [senderInfo.senderId] : [];
           const mentionText = senderInfo ? `@${senderInfo.senderPhone}` : '';
-          await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions });
-          console.log(`  [Bot] @${pending.senderName} ${extraction.response}`);
+
+          // Find the most relevant message to quote (prefer photo message)
+          const photoMsg = pending.messages.find(m => m.photo);
+          const msgToQuote = photoMsg || pending.messages[pending.messages.length - 1];
+          const quoteOptions = msgToQuote?.msgId
+            ? { mentions, quotedMessageId: msgToQuote.msgId }
+            : { mentions };
+
+          await chat.sendMessage(`${mentionText} ${extraction.response}`.trim(), quoteOptions);
+          console.log(`  [Bot] @${pending.senderName} ${extraction.response}${msgToQuote?.msgId ? ' (quoted)' : ''}`);
 
           // Check if we have an address in the messages - if so, save partial request
           // so we don't re-extract old messages when user responds
@@ -588,19 +619,24 @@ class TrashReportBot {
               const partialAddress = `${addressMatch[1].trim()} ${addressMatch[2]}`;
               const photo = pending.messages.find(m => m.photo)?.photo;
 
-              console.log(`  [Partial] Saving partial request: ${partialAddress} (awaiting reportType)`);
+              // Use Claude's awaitingField if provided, otherwise default to 'reportType'
+              const awaitingField = extraction.awaitingField || 'reportType';
+              // Use partialRequest from Claude if available, which includes reportType already identified
+              const partialInfo = extraction.partialRequest || {};
+              console.log(`  [Partial] Saving partial request: ${partialInfo.address || partialAddress} (awaiting ${awaitingField}, reportType: ${partialInfo.reportType || 'unknown'})`);
 
-              // Save as pending info request awaiting reportType
+              // Save as pending info request
               if (!this.pendingInfoRequests) {
                 this.pendingInfoRequests = new Map();
               }
               this.pendingInfoRequests.set(senderId, {
                 senderId,
                 senderName: pending.senderName,
-                address: partialAddress,
+                address: partialInfo.address || partialAddress,
                 photo,
                 chat,
-                awaitingField: 'reportType',
+                reportType: partialInfo.reportType || null,  // Save reportType if Claude already identified it
+                awaitingField,
                 awaitingQuestion: extraction.response
               });
 
@@ -630,14 +666,81 @@ class TrashReportBot {
         const processedAddresses = this.getProcessedSolicitudes();
         const newRequests = [];
         const duplicates = [];
+        const invalidAddresses = [];
 
+        // Helper to validate addresses
+        const isValidAddress = (address) => {
+          if (!address || typeof address !== 'string') return false;
+          // Must have at least one number (street number)
+          if (!/\d+/.test(address)) return false;
+          // Must not be placeholder text
+          const invalidPatterns = [
+            /pendiente/i,
+            /no proporcionada/i,
+            /información/i,
+            /no especificad/i,
+            /sin dirección/i,
+            /falta dirección/i
+          ];
+          if (invalidPatterns.some(p => p.test(address))) return false;
+          // Must be reasonable length (at least "X 1" = 3 chars, max reasonable address)
+          if (address.length < 3 || address.length > 100) return false;
+          return true;
+        };
+
+        const needsSchedule = []; // Manteros requests that need schedule info
         for (const req of extraction.requests) {
+          // Validate address first
+          if (!isValidAddress(req.address)) {
+            console.log(`  [Invalid] Skipping invalid address: "${req.address}"`);
+            invalidAddresses.push(req);
+            continue;
+          }
+
           const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses);
           if (recentDupe) {
             duplicates.push({ address: req.address, reportType: req.reportType, solicitudNumber: recentDupe.solicitudNumber });
+          } else if (req.reportType === 'manteros' && (!req.schedule || req.schedule === 'No especificado')) {
+            // Manteros requests need a schedule - ask for it instead of queueing
+            needsSchedule.push(req);
           } else {
             newRequests.push(req);
           }
+        }
+
+        // Handle manteros requests that need schedule info
+        if (needsSchedule.length > 0 && newRequests.length === 0 && duplicates.length === 0) {
+          const req = needsSchedule[0]; // Handle first one
+          const photoMsg = pending.messages.find(m => m.photo);
+          const photo = photoMsg?.photo || null;
+          const scheduleQuestion = `¿Qué días y horarios están los vendedores ambulantes en ${req.address}?`;
+
+          // Quote the photo message if available
+          const msgToQuote = photoMsg || pending.messages.find(m => m.text?.toLowerCase().includes('mantero'));
+          const quoteOptions = msgToQuote?.msgId
+            ? { mentions, quotedMessageId: msgToQuote.msgId }
+            : { mentions };
+
+          console.log(`  [Manteros] Need schedule for ${req.address}, asking user...`);
+          await chat.sendMessage(`${mentionText} ${scheduleQuestion}`.trim(), quoteOptions);
+
+          // Save as pending info request awaiting schedule
+          if (!this.pendingInfoRequests) {
+            this.pendingInfoRequests = new Map();
+          }
+          this.pendingInfoRequests.set(senderId, {
+            senderId,
+            senderName: pending.senderName,
+            address: req.address,
+            photo,
+            chat,
+            reportType: 'manteros',
+            awaitingField: 'schedule',
+            awaitingQuestion: scheduleQuestion
+          });
+
+          pendingMessages.delete(senderId);
+          return;
         }
 
         // Notify about duplicates
@@ -738,8 +841,7 @@ class TrashReportBot {
 
         // Log request details
         for (const req of newRequests) {
-          const reportTypeLabel = req.reportType === 'barrido' ? 'barrido' : 'recoleccion';
-          console.log(`    - ${req.address} (tipo: ${reportTypeLabel}, msgIndex: ${req.msgIndex || 'auto'})`);
+          console.log(`    - ${req.address} (tipo: ${req.reportType}, msgIndex: ${req.msgIndex || 'auto'})`);
         }
         for (const dupe of duplicates) {
           console.log(`    - ${dupe.address} (DUPLICADO - #${dupe.solicitudNumber})`);
@@ -759,39 +861,51 @@ class TrashReportBot {
   }
 
   async extractRequests(pending, senderId, includeBotContext = false) {
-      // IMPORTANT: Balance between not re-processing old messages and maintaining context
-      // - If we asked a question (photo without address, etc.), include recent history for context
-      // - If this is a fresh interaction, only process new messages
+      // Always include recent context so Claude understands the full picture
+      // This ensures different issues from the same user are properly distinguished
 
       const hasPendingInfoRequest = this.pendingInfoRequests?.has(senderId);
       const askedQuestionRecently = pending.askedQuestion === true;
-
-      // Check if there are photos in history that might be relevant
       const userHistory = senderId ? (userMessageHistory.get(senderId) || []) : [];
-      const recentPhotos = userHistory.slice(-5).filter(m => m.photo);
-      const newMessagesHaveNoPhotos = !pending.messages.some(m => m.photo);
-      const needsPhotoContext = recentPhotos.length > 0 && newMessagesHaveNoPhotos;
 
+      // Always provide context from last 10 messages, but mark which are NEW vs HISTORY
+      const historyMessages = userHistory.slice(-10);
+      const newMessageIds = new Set(pending.messages.map(m => m.timestamp?.getTime()));
+
+      // Build context summary of recent history (excluding current batch)
+      const historyContext = historyMessages
+        .filter(m => !newMessageIds.has(m.timestamp?.getTime()))
+        .map(m => {
+          let desc = m.text || '';
+          if (m.photo) {
+            if (m.photoDescription) {
+              desc += desc ? ` [FOTO: ${m.photoDescription}]` : `[FOTO: ${m.photoDescription}]`;
+            } else {
+              desc += desc ? ' [FOTO]' : '[FOTO]';
+            }
+          }
+          return desc;
+        })
+        .filter(d => d.length > 0);
+
+      // Messages to actually process (with images) - use history if needed, otherwise just new
       let messagesToProcess;
-      if (hasPendingInfoRequest || askedQuestionRecently || needsPhotoContext) {
-        // Use recent history for context when:
-        // 1. We're waiting for info (retry flow)
-        // 2. We asked a question like "What address?"
-        // 3. User sends text but recent history has photos (likely responding to photo)
-        messagesToProcess = userHistory.slice(-5); // Last 5 for context
-        const reason = hasPendingInfoRequest ? 'pending info request'
-                     : askedQuestionRecently ? 'asked question recently'
-                     : 'photo in recent history';
+      if (hasPendingInfoRequest || askedQuestionRecently) {
+        // Use recent history for full context when waiting for info
+        messagesToProcess = historyMessages.slice(-5);
+        const reason = hasPendingInfoRequest ? 'pending info request' : 'asked question recently';
         console.log(`  [Context] Using history (${reason}) - ${messagesToProcess.length} messages`);
 
-        // Clear the askedQuestion flag now that we're processing the follow-up
         if (askedQuestionRecently) {
           pending.askedQuestion = false;
         }
       } else {
-        // Normal mode: ONLY process the NEW pending messages
+        // Normal mode: process NEW messages, but Claude sees history context
         messagesToProcess = pending.messages;
         console.log(`  [Context] Processing ${messagesToProcess.length} NEW message(s) from ${senderId?.split('@')[0] || 'unknown'}`);
+        if (historyContext.length > 0) {
+          console.log(`  [Context] Including ${historyContext.length} recent history messages as context`);
+        }
       }
 
       // Build bot context if provided (for startup recovery)
@@ -813,12 +927,18 @@ class TrashReportBot {
       const photos = messagesToProcess.filter(m => m.photo).map(m => m.photo);
       const hasPhotos = photos.length > 0;
 
-      const prompt = `${botContextText}MENSAJES DE ${pending.senderName}:
+      // Build history context string if we have previous messages
+      let historyText = '';
+      if (historyContext.length > 0) {
+        historyText = `\nMENSAJES RECIENTES (ya procesados, solo para contexto):\n${historyContext.map((h, i) => `- ${h}`).join('\n')}\n`;
+      }
+
+      const prompt = `${botContextText}${historyText}MENSAJES NUEVOS DE ${pending.senderName}:
 ${messagesWithPhotos}
 
-${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto corresponde al mensaje marcado con [+FOTO]]` : '[No envió fotos]'}
+${hasPhotos ? `[Envió ${photos.length} foto(s) NUEVA(s) - analizalas. Cada foto corresponde al mensaje marcado con [+FOTO]]` : '[No envió fotos nuevas]'}
 
-¿Hay algo actionable? Recordá que DEBE verse un contenedor de CABA en la foto para ser válido.${botContextText ? '\n\nIMPORTANTE: Si ya preguntaste algo arriba, NO vuelvas a preguntar lo mismo.' : ''}`;
+¿Hay algo actionable en los mensajes NUEVOS? Recordá que DEBE verse un contenedor de CABA en la foto para ser válido.${botContextText ? '\n\nIMPORTANTE: Si ya preguntaste algo arriba, NO vuelvas a preguntar lo mismo.' : ''}`;
 
       // Build message content with images if available
       const content = [];
@@ -919,6 +1039,37 @@ ${hasPhotos ? `[Envió ${photos.length} foto(s) - analizalas. Cada foto correspo
                       msgIndex: 1
                     }];
                     result.photoValid = true; // Override
+                  }
+                }
+
+                // Store image analysis descriptions in message history for future context
+                // This helps Claude understand what previous images contained
+                if (result.requests?.length > 0 || result.photoValid !== undefined) {
+                  const reportTypeLabels = {
+                    recoleccion: 'basura/residuos cerca de contenedor',
+                    barrido: 'calle sucia, necesita barrido',
+                    obstruccion: 'obstrucción en vereda',
+                    ocupacion_comercial: 'ocupación por comercio',
+                    ocupacion_gastronomica: 'ocupación gastronómica',
+                    manteros: 'vendedores ambulantes/manteros'
+                  };
+
+                  for (const m of messagesToProcess) {
+                    if (m.photo && !m.photoDescription) {
+                      // Find the request that matches this message
+                      const matchingReq = result.requests?.find(r => r.msgIndex && messagesToProcess[r.msgIndex - 1] === m);
+                      if (matchingReq) {
+                        m.photoDescription = `${reportTypeLabels[matchingReq.reportType] || matchingReq.reportType} en ${matchingReq.address}`;
+                        console.log(`  [PhotoDesc] ${path.basename(m.photo)} → "${m.photoDescription}"`);
+                      } else if (result.photoValid === false) {
+                        m.photoDescription = 'foto no válida para reporte';
+                        console.log(`  [PhotoDesc] ${path.basename(m.photo)} → "foto no válida"`);
+                      } else if (result.response) {
+                        // Claude asked a question, mark as pending analysis
+                        m.photoDescription = 'pendiente de más info';
+                        console.log(`  [PhotoDesc] ${path.basename(m.photo)} → "pendiente de más info"`);
+                      }
+                    }
                   }
                 }
 
@@ -1638,10 +1789,23 @@ Respondé SOLO con la dirección limpia, nada más.`,
           // Check if user requested posting to X/Twitter
           const shouldPostToX = this.shouldPostToX(userData.messages);
 
+          // Helper to validate addresses
+          const isValidAddress = (address) => {
+            if (!address || typeof address !== 'string') return false;
+            if (!/\d+/.test(address)) return false; // Must have street number
+            const invalidPatterns = [
+              /pendiente/i, /no proporcionada/i, /información/i,
+              /no especificad/i, /sin dirección/i, /falta dirección/i
+            ];
+            if (invalidPatterns.some(p => p.test(address))) return false;
+            if (address.length < 3 || address.length > 100) return false;
+            return true;
+          };
+
           for (const req of extraction.requests) {
-            // Skip if no address
-            if (!req.address) {
-              console.log(`[Startup] Request sin dirección, ignorando`);
+            // Skip if no address or invalid address
+            if (!isValidAddress(req.address)) {
+              console.log(`[Startup] Invalid/missing address, ignorando: "${req.address}"`);
               continue;
             }
             // Skip if already processed in last 12 hours (per address + report type)
