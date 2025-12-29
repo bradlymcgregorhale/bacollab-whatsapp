@@ -51,7 +51,7 @@ const REPORTS_LOG = path.join(__dirname, 'reports.csv');
 
 // Initialize reports log with header if it doesn't exist
 if (!fs.existsSync(REPORTS_LOG)) {
-  fs.writeFileSync(REPORTS_LOG, 'numero,fecha,direccion,reportType,link,timestamp\n');
+  fs.writeFileSync(REPORTS_LOG, 'numero,fecha,direccion,reportType,patente,link,timestamp\n');
 }
 
 // Errors log file
@@ -79,6 +79,10 @@ const userProcessingLocks = new Map();
 // Key: senderId, Value: { messages: [], timer: null, senderName: string }
 // messages format: { text: string|null, photo: string|null, timestamp: Date }
 const pendingMessages = new Map();
+
+// Queue for vehicle reports awaiting patente confirmation (startup only)
+// Key: senderId, Value: array of vehicle report objects
+const vehiclePatenteQueue = new Map();
 
 // Group message history - per user, kept for 2 hours
 // Key: senderId, Value: [{ text, photo, timestamp }]
@@ -283,21 +287,29 @@ class TrashReportBot {
 
       // Handle photo or video
       if (msg.hasMedia) {
-        const media = await msg.downloadMedia();
-        if (media && media.mimetype.startsWith('image/')) {
-          const photoPath = await this.savePhoto(media, senderId);
-          messageObj.photo = photoPath;
-          console.log(`  Foto guardada: ${photoPath}`);
-        } else if (media && media.mimetype.startsWith('video/')) {
-          // Extract first frame from video using ffmpeg
-          console.log(`  Video detectado, extrayendo frame...`);
-          const photoPath = await this.extractVideoFrame(media, senderId);
-          if (photoPath) {
+        try {
+          const media = await msg.downloadMedia();
+          if (!media) {
+            console.log(`  ⚠️ Media download returned null`);
+          } else if (media.mimetype.startsWith('image/')) {
+            const photoPath = await this.savePhoto(media, senderId);
             messageObj.photo = photoPath;
-            console.log(`  Frame extraído: ${photoPath}`);
+            console.log(`  Foto guardada: ${photoPath}`);
+          } else if (media.mimetype.startsWith('video/')) {
+            // Extract first frame from video using ffmpeg
+            console.log(`  Video detectado, extrayendo frame...`);
+            const photoPath = await this.extractVideoFrame(media, senderId);
+            if (photoPath) {
+              messageObj.photo = photoPath;
+              console.log(`  Frame extraído: ${photoPath}`);
+            } else {
+              console.log(`  No se pudo extraer frame del video`);
+            }
           } else {
-            console.log(`  No se pudo extraer frame del video`);
+            console.log(`  ⚠️ Unsupported media type: ${media.mimetype}`);
           }
+        } catch (mediaError) {
+          console.log(`  ⚠️ Error downloading media: ${mediaError.message}`);
         }
       }
 
@@ -410,8 +422,31 @@ class TrashReportBot {
 
       console.log(`\n[Pending Info] Checking response for field: ${awaitingField}`);
 
-      // Handle based on what field we're waiting for
-      if (awaitingField === 'photo') {
+      // Check if this looks like a NEW, DIFFERENT report (not a response to pending question)
+      // This prevents old pending requests from interfering with new reports
+      const hasNewPhotos = pending.messages.some(m => m.photo);
+      const messageText = lastMessage?.text?.toLowerCase() || '';
+
+      // Detect if message contains a new address (different from pending)
+      const addressPattern = /\b(\d+|\w+\.?\s+\w+)\s+\d{2,5}\b|^\s*\w+\.?\s+\w*\s+\d{2,5}/i;
+      const hasNewAddress = lastMessage?.text && addressPattern.test(lastMessage.text);
+      const pendingAddress = pendingRequest.address?.toLowerCase() || '';
+      const isDifferentAddress = hasNewAddress && !messageText.includes(pendingAddress.toLowerCase().split(' ')[0]);
+
+      // Detect clear new report patterns (photo + address, or different problem type)
+      const newReportPatterns = /basura|residuos|contenedor|barrido|obstruc|ocupaci|mantero|puesto|vehículo|estacionad/i;
+      const looksLikeNewReport = (hasNewPhotos && hasNewAddress) ||
+                                  (isDifferentAddress && newReportPatterns.test(messageText));
+
+      if (looksLikeNewReport) {
+        console.log(`[Pending Info] Detected NEW report (different from pending request for ${awaitingField})`);
+        console.log(`  - Pending address: ${pendingRequest.address}, new has photos: ${hasNewPhotos}, different address: ${isDifferentAddress}`);
+        console.log(`  - Clearing pending request and processing as new report`);
+        this.pendingInfoRequests.delete(senderId);
+        // Continue to normal flow below (don't return)
+      } else {
+        // Handle based on what field we're waiting for
+        if (awaitingField === 'photo') {
         // Looking for a photo - first check new messages
         let photoMsg = pending.messages.find(m => m.photo);
 
@@ -499,6 +534,17 @@ class TrashReportBot {
             // We have all the info, submit
             this.pendingInfoRequests.delete(senderId);
             pendingMessages.delete(senderId);
+
+            // Remove from vehiclePatenteQueue if present
+            if (vehiclePatenteQueue.has(senderId)) {
+              const vehicles = vehiclePatenteQueue.get(senderId);
+              vehicles.shift(); // Remove the first (submitted) vehicle
+              if (vehicles.length === 0) {
+                vehiclePatenteQueue.delete(senderId);
+              }
+              console.log(`[Pending Info] Removed submitted vehicle from queue (${vehicles.length} remaining)`);
+            }
+
             console.log(`[Pending Info] Vehicle report ready with ${pendingRequest.photos.length} photos, submitting`);
             await this.submitRequest(pendingRequest);
             return;
@@ -525,7 +571,8 @@ class TrashReportBot {
         this.pendingInfoRequests.delete(senderId);
         pendingMessages.delete(senderId);
 
-        console.log(`[Pending Info] Resubmitting with cleaned address: "${cleanAddress}"`);
+        const photoCount = pendingRequest.photos?.length || (pendingRequest.photo ? 1 : 0);
+        console.log(`[Pending Info] Resubmitting with cleaned address: "${cleanAddress}" (${photoCount} photo(s))`);
         await this.submitRequest(pendingRequest);
         return;
       } else if (awaitingField === 'reportType' && lastMessage?.text) {
@@ -631,6 +678,33 @@ class TrashReportBot {
             pendingRequest.infractionTime = lastMessage.text;
             console.log(`[Pending Info] Set infractionTime (raw): "${pendingRequest.infractionTime}"`);
           }
+        } else if (awaitingField === 'patenteConfirmation') {
+          // User confirming or correcting the patente we read
+          const responseText = lastMessage.text.toLowerCase().trim();
+          const confirmPhrases = /^(si|sí|ok|dale|correcto|correcta|bien|esa|sep|sip|yes|y)$/i;
+
+          if (confirmPhrases.test(responseText)) {
+            // User confirmed - keep the patente as-is
+            console.log(`[Pending Info] Patente confirmed: "${pendingRequest.patente}"`);
+          } else {
+            // User provided correction - extract new patente
+            const patenteMatch = lastMessage.text.toUpperCase().match(/[A-Z0-9]{6,7}/);
+            if (patenteMatch) {
+              const oldPatente = pendingRequest.patente;
+              pendingRequest.patente = patenteMatch[0];
+              console.log(`[Pending Info] Patente corrected: "${oldPatente}" → "${pendingRequest.patente}"`);
+            } else {
+              // Try to use the whole response as patente
+              const cleanedPatente = lastMessage.text.toUpperCase().replace(/\s/g, '').substring(0, 7);
+              if (cleanedPatente.length >= 6) {
+                const oldPatente = pendingRequest.patente;
+                pendingRequest.patente = cleanedPatente;
+                console.log(`[Pending Info] Patente corrected (raw): "${oldPatente}" → "${pendingRequest.patente}"`);
+              } else {
+                console.log(`[Pending Info] Could not parse patente correction, keeping original: "${pendingRequest.patente}"`);
+              }
+            }
+          }
         } else if (awaitingField === 'schedule' || pendingRequest.awaitingQuestion?.includes('horario') || pendingRequest.awaitingQuestion?.includes('días')) {
           pendingRequest.schedule = lastMessage.text;
           console.log(`[Pending Info] Set schedule: "${lastMessage.text}"`);
@@ -642,14 +716,65 @@ class TrashReportBot {
         this.pendingInfoRequests.delete(senderId);
         pendingMessages.delete(senderId);
 
-        console.log(`[Pending Info] Resubmitting with: schedule="${pendingRequest.schedule || 'none'}", situationType="${pendingRequest.situationType || 'none'}", patente="${pendingRequest.patente || 'none'}", infractionTime="${pendingRequest.infractionTime || 'none'}", reportType="${pendingRequest.reportType || 'not set'}"`);
+        const photoCount = pendingRequest.photos?.length || (pendingRequest.photo ? 1 : 0);
+        console.log(`[Pending Info] Resubmitting with: patente="${pendingRequest.patente || 'none'}", infractionTime="${pendingRequest.infractionTime || 'none'}", reportType="${pendingRequest.reportType || 'not set'}", photos=${photoCount}`);
         await this.submitRequest(pendingRequest);
+
+        // Check if there are more vehicles in the patente confirmation queue
+        if (awaitingField === 'patenteConfirmation' && vehiclePatenteQueue.has(senderId)) {
+          const vehicles = vehiclePatenteQueue.get(senderId);
+          // Remove the one we just submitted (first in queue)
+          vehicles.shift();
+
+          if (vehicles.length > 0) {
+            // Set up the next vehicle
+            const nextVehicle = vehicles[0];
+            const nextMissingField = nextVehicle.missingField || 'patenteConfirmation';
+            console.log(`[Pending Info] ${vehicles.length} more vehicle(s) in queue, asking ${nextMissingField} for ${nextVehicle.patente}`);
+
+            this.pendingInfoRequests.set(senderId, {
+              ...nextVehicle,
+              awaitingField: nextMissingField,
+              timestamp: Date.now()
+            });
+
+            // Ask the appropriate question (quote the original photo message)
+            try {
+              const chat = nextVehicle.chat || pendingRequest.chat;
+              const senderPhone = senderId.split('@')[0];
+              const mentionText = `@${senderPhone}`;
+              const queueInfo = vehicles.length > 1 ? ` (1 de ${vehicles.length} vehículos restantes)` : '';
+
+              let question;
+              if (nextMissingField === 'photos') {
+                question = `Para reportar el vehículo mal estacionado en ${nextVehicle.address} necesito dos fotos: una de la infracción y otra de la patente.${queueInfo} ¿Podés mandar la otra foto?`;
+              } else {
+                question = `Leí la patente como ${nextVehicle.patente}. ¿Es correcta?${queueInfo} (respondé "si" o la patente correcta)`;
+              }
+
+              const messageOptions = { mentions: [senderId] };
+              if (nextVehicle.photoMsgId) {
+                messageOptions.quotedMessageId = nextVehicle.photoMsgId;
+              }
+              await chat.sendMessage(`${mentionText} ${question}`, messageOptions);
+              console.log(`[Pending Info] Asked ${nextMissingField} for next vehicle: ${nextVehicle.patente}${nextVehicle.photoMsgId ? ' (quoted)' : ''}`);
+            } catch (e) {
+              console.log(`[Pending Info] Error sending next vehicle question: ${e.message}`);
+            }
+          } else {
+            // No more vehicles, clear the queue
+            vehiclePatenteQueue.delete(senderId);
+            console.log(`[Pending Info] All vehicles processed for ${senderId.split('@')[0]}`);
+          }
+        }
+
         return;
       }
 
       // If we get here, user responded but not with what we needed
       // Let the normal flow continue to re-analyze
       console.log(`[Pending Info] Response didn't match expected field ${awaitingField}, continuing normal flow`);
+      } // Close the else block for looksLikeNewReport check
     }
 
     const photoCount = pending.messages.filter(m => m.photo).length;
@@ -730,9 +855,9 @@ class TrashReportBot {
               const awaitingField = extraction.awaitingField || 'reportType';
               // Use partialRequest from Claude if available, which includes reportType already identified
               const partialInfo = extraction.partialRequest || {};
-              console.log(`  [Partial] Saving partial request: ${partialInfo.address || partialAddress} (awaiting ${awaitingField}, reportType: ${partialInfo.reportType || 'unknown'})`);
-
-              // Save as pending info request
+              // Save as pending info request - include all photos for vehicle reports
+              const allPhotos = pending.messages.filter(m => m.photo).map(m => m.photo);
+              console.log(`  [Partial] Saving partial request: ${partialInfo.address || partialAddress} (awaiting ${awaitingField}, reportType: ${partialInfo.reportType || 'unknown'}, patente: ${partialInfo.patente || 'none'}, photos: ${allPhotos.length})`);
               if (!this.pendingInfoRequests) {
                 this.pendingInfoRequests = new Map();
               }
@@ -741,8 +866,11 @@ class TrashReportBot {
                 senderName: pending.senderName,
                 address: partialInfo.address || partialAddress,
                 photo,
+                photos: allPhotos.length > 0 ? allPhotos : null,  // Save all photos for vehicle reports
                 chat,
                 reportType: partialInfo.reportType || null,  // Save reportType if Claude already identified it
+                patente: partialInfo.patente || null,  // Save patente if Claude extracted it
+                infractionTime: partialInfo.infractionTime || null,  // Save time if Claude extracted it
                 awaitingField,
                 awaitingQuestion: extraction.response
               });
@@ -800,6 +928,13 @@ class TrashReportBot {
         const needsVehicleInfo = []; // Vehicle requests that need patente or infractionTime
         const photoCount = pending.messages.filter(m => m.photo).length;
 
+        // Log what Claude returned
+        console.log(`  [Claude Requests] ${extraction.requests.length} request(s) extracted:`);
+        for (const r of extraction.requests) {
+          const xFlag = r.postToX ? ' | POST TO X' : '';
+          console.log(`    - ${r.address} | ${r.reportType} | patente: ${r.patente || 'none'} | time: ${r.infractionTime || 'none'} | msgIndex: ${r.msgIndex || 'auto'}${xFlag}`);
+        }
+
         for (const req of extraction.requests) {
           // Validate address first
           if (!isValidAddress(req.address)) {
@@ -808,9 +943,9 @@ class TrashReportBot {
             continue;
           }
 
-          const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses);
+          const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses, req.patente);
           if (recentDupe) {
-            duplicates.push({ address: req.address, reportType: req.reportType, solicitudNumber: recentDupe.solicitudNumber });
+            duplicates.push({ address: req.address, reportType: req.reportType, solicitudNumber: recentDupe.solicitudNumber, patente: req.patente });
           } else if (req.reportType === 'manteros' && (!req.schedule || req.schedule === 'No especificado')) {
             // Manteros requests need a schedule - ask for it instead of queueing
             needsSchedule.push(req);
@@ -818,7 +953,7 @@ class TrashReportBot {
             // Puesto requests need a situation type - ask for it instead of queueing
             needsSituationType.push(req);
           } else if (req.reportType === 'vehiculo_mal_estacionado') {
-            // Vehicle reports need: 2 photos, patente, and infractionTime
+            // Vehicle reports need: 2 photos, patente, infractionTime, AND patente confirmation
             if (photoCount < 2) {
               console.log(`  [Vehicle] Only ${photoCount} photo(s), need 2`);
               needsVehicleInfo.push({ ...req, missingField: 'photos' });
@@ -829,7 +964,9 @@ class TrashReportBot {
               console.log(`  [Vehicle] Missing infractionTime`);
               needsVehicleInfo.push({ ...req, missingField: 'infractionTime' });
             } else {
-              newRequests.push(req);
+              // All info present - but need to confirm patente before submitting
+              console.log(`  [Vehicle] Complete, needs patente confirmation: ${req.patente}`);
+              needsVehicleInfo.push({ ...req, missingField: 'patenteConfirmation' });
             }
           } else {
             newRequests.push(req);
@@ -908,48 +1045,105 @@ class TrashReportBot {
         }
 
         // Handle vehiculo_mal_estacionado requests that need info
-        if (needsVehicleInfo.length > 0 && newRequests.length === 0 && duplicates.length === 0) {
-          const req = needsVehicleInfo[0]; // Handle first one
-          const allPhotos = pending.messages.filter(m => m.photo).map(m => m.photo);
-          const photoMsg = pending.messages.find(m => m.photo);
-          let question = '';
+        // If there are NO other requests, handle immediately; otherwise queue for later
+        if (needsVehicleInfo.length > 0) {
+          // Get ALL request msgIndex values to know boundaries for photo collection
+          // This includes vehicles AND other reports to avoid mixing photos
+          const allRequestMsgIndexes = [
+            ...needsVehicleInfo.filter(r => r.msgIndex).map(r => r.msgIndex),
+            ...newRequests.filter(r => r.msgIndex).map(r => r.msgIndex)
+          ].sort((a, b) => a - b);
 
-          if (req.missingField === 'photos') {
-            question = `Para reportar un vehículo mal estacionado necesito dos fotos: una de la infracción y otra de la patente. ¿Podés mandar la otra foto?`;
-          } else if (req.missingField === 'patente') {
-            question = `No puedo leer la patente en las fotos. ¿Podés decirme cuál es la patente del vehículo? (ej: ABC123 o AB123CD)`;
-          } else if (req.missingField === 'infractionTime') {
-            question = `¿A qué hora viste el vehículo mal estacionado en ${req.address}? (ej: 14:30)`;
+          for (const req of needsVehicleInfo) {
+            // Collect photos for THIS specific vehicle (respect boundaries)
+            const startIdx = req.msgIndex ? req.msgIndex - 1 : 0;
+            const nextReportIdx = allRequestMsgIndexes.find(idx => idx > (req.msgIndex || 1));
+            const endIdx = nextReportIdx ? nextReportIdx - 1 : pending.messages.length;
+
+            console.log(`  [Vehicle] Photo collection for ${req.patente}: startIdx=${startIdx}, endIdx=${endIdx}, nextReportIdx=${nextReportIdx || 'none'}`);
+
+            const vehiclePhotos = [];
+            let primaryPhotoMsgId = null;
+            for (let i = startIdx; i < endIdx; i++) {
+              const msg = pending.messages[i];
+              console.log(`    [Vehicle] Checking msg ${i + 1}: photo=${msg?.photo ? 'yes' : 'no'}, text="${msg?.text || '(none)'}"`);
+              if (msg?.photo) {
+                vehiclePhotos.push(msg.photo);
+                if (!primaryPhotoMsgId) primaryPhotoMsgId = msg.msgId;
+              }
+            }
+            console.log(`  [Vehicle] Collected ${vehiclePhotos.length} photo(s) for ${req.patente}`);
+
+            // Vehicle reports require at least 2 photos (infraction + patente)
+            // If we don't have 2 photos, override missingField to ask for more
+            let effectiveMissingField = req.missingField;
+            if (vehiclePhotos.length < 2) {
+              console.log(`  [Vehicle] ⚠️ Only ${vehiclePhotos.length} photo(s), need at least 2. Setting missingField to 'photos'`);
+              effectiveMissingField = 'photos';
+            }
+
+            const vehicleReport = {
+              senderId,
+              senderName: pending.senderName,
+              address: req.address,
+              photos: vehiclePhotos,
+              chat,
+              reportType: 'vehiculo_mal_estacionado',
+              patente: req.patente || null,
+              infractionTime: req.infractionTime || null,
+              missingField: effectiveMissingField,
+              photoMsgId: primaryPhotoMsgId,
+              postToX: req.postToX || false
+            };
+
+            // Add to vehicle patente queue
+            if (!vehiclePatenteQueue.has(senderId)) {
+              vehiclePatenteQueue.set(senderId, []);
+            }
+            vehiclePatenteQueue.get(senderId).push(vehicleReport);
+            console.log(`  [Vehicle] Queued ${req.patente || 'unknown'} for ${req.missingField} (${vehiclePatenteQueue.get(senderId).length} in queue)`);
           }
 
-          // Quote the photo message if available
-          const msgToQuote = photoMsg || pending.messages[pending.messages.length - 1];
-          const quoteOptions = msgToQuote?.msgId
-            ? { mentions, quotedMessageId: msgToQuote.msgId }
-            : { mentions };
+          // If there are NO other requests, start asking immediately
+          if (newRequests.length === 0 && duplicates.length === 0) {
+            const vehicles = vehiclePatenteQueue.get(senderId);
+            const firstVehicle = vehicles[0];
 
-          console.log(`  [Vehicle] Need ${req.missingField} for ${req.address}, asking user...`);
-          await chat.sendMessage(`${mentionText} ${question}`.trim(), quoteOptions);
+            let question = '';
+            if (firstVehicle.missingField === 'photos') {
+              question = `Para reportar un vehículo mal estacionado necesito dos fotos: una de la infracción y otra de la patente. ¿Podés mandar la otra foto?`;
+            } else if (firstVehicle.missingField === 'patente') {
+              question = `No puedo leer la patente en las fotos. ¿Podés decirme cuál es la patente del vehículo? (ej: ABC123 o AB123CD)`;
+            } else if (firstVehicle.missingField === 'infractionTime') {
+              question = `¿A qué hora viste el vehículo mal estacionado en ${firstVehicle.address}? (ej: 14:30)`;
+            } else if (firstVehicle.missingField === 'patenteConfirmation') {
+              const queueInfo = vehicles.length > 1 ? ` (1 de ${vehicles.length} vehículos)` : '';
+              question = `Leí la patente como ${firstVehicle.patente}. ¿Es correcta?${queueInfo} (respondé "si" o la patente correcta)`;
+            }
 
-          // Save as pending info request
-          if (!this.pendingInfoRequests) {
-            this.pendingInfoRequests = new Map();
+            const messageOptions = { mentions };
+            if (firstVehicle.photoMsgId) {
+              messageOptions.quotedMessageId = firstVehicle.photoMsgId;
+            }
+
+            console.log(`  [Vehicle] Need ${firstVehicle.missingField} for ${firstVehicle.address}, asking user...`);
+            await chat.sendMessage(`${mentionText} ${question}`.trim(), messageOptions);
+
+            // Save as pending info request
+            if (!this.pendingInfoRequests) {
+              this.pendingInfoRequests = new Map();
+            }
+            this.pendingInfoRequests.set(senderId, {
+              ...firstVehicle,
+              awaitingField: firstVehicle.missingField,
+              awaitingQuestion: question
+            });
+
+            pendingMessages.delete(senderId);
+            return;
           }
-          this.pendingInfoRequests.set(senderId, {
-            senderId,
-            senderName: pending.senderName,
-            address: req.address,
-            photos: allPhotos,
-            chat,
-            reportType: 'vehiculo_mal_estacionado',
-            patente: req.patente || null,
-            infractionTime: req.infractionTime || null,
-            awaitingField: req.missingField,
-            awaitingQuestion: question
-          });
-
-          pendingMessages.delete(senderId);
-          return;
+          // If there ARE other requests, continue processing them below
+          // Vehicle patente confirmation will happen after other requests are queued
         }
 
         // Notify about duplicates
@@ -1003,14 +1197,21 @@ class TrashReportBot {
           await chat.sendMessage(`${mentionText} Ya mando la solicitud de ${descriptionText}...`.trim(), { mentions });
           console.log(`  [Bot] Procesando: ${descriptionText}`);
 
-          // Check if user requested posting to X/Twitter
-          const shouldPostToX = this.shouldPostToX(pending.messages);
+          // Get all vehicle request msgIndex values to know boundaries (avoid mixing photos)
+          const vehicleMsgIndexes = newRequests
+            .filter(r => r.reportType === 'vehiculo_mal_estacionado' && r.msgIndex)
+            .map(r => r.msgIndex)
+            .sort((a, b) => a - b);
 
           let queuedCount = 0;
           for (const req of newRequests) {
             // In-memory dedup: skip if this address was queued recently
             // Use normalizeAddressForComparison for consistent key generation
-            const addrKey = this.normalizeAddressForComparison(req.address);
+            // For vehicle reports, include patente in the key (different vehicles at same address are different reports)
+            let addrKey = this.normalizeAddressForComparison(req.address);
+            if (req.reportType === 'vehiculo_mal_estacionado' && req.patente) {
+              addrKey = `${addrKey}|${req.patente.toUpperCase()}`;
+            }
             const recentlyQueued = recentlyQueuedAddresses.get(addrKey);
             if (recentlyQueued && (Date.now() - recentlyQueued) < QUEUE_DEDUP_WINDOW_MS) {
               console.log(`  [Dedup] Skipping ${req.address} (key: ${addrKey}) - queued ${Math.round((Date.now() - recentlyQueued) / 1000)}s ago`);
@@ -1018,17 +1219,12 @@ class TrashReportBot {
             }
 
             let photo = null;
-            let photos = null; // For vehiculo_mal_estacionado: collect ALL photos
+            let photos = null; // For vehiculo_mal_estacionado: related photos only
 
-            // For vehiculo_mal_estacionado, collect ALL photos from the messages
-            if (req.reportType === 'vehiculo_mal_estacionado') {
-              photos = pending.messages.filter(m => m.photo).map(m => m.photo);
-              console.log(`  [Vehicle] Collected ${photos.length} photo(s) for vehicle report`);
-            }
-
-            // Use msgIndex if provided (1-indexed)
-            if (req.msgIndex && pending.messages[req.msgIndex - 1]?.photo) {
-              photo = pending.messages[req.msgIndex - 1].photo;
+            // Use msgIndex if provided (1-indexed) to find the primary photo
+            const primaryMsgIndex = req.msgIndex ? req.msgIndex - 1 : null;
+            if (primaryMsgIndex !== null && pending.messages[primaryMsgIndex]?.photo) {
+              photo = pending.messages[primaryMsgIndex].photo;
             } else {
               // Fallback: find by address match or use most recent photo
               const matchingMsg = [...pending.messages].reverse().find(m =>
@@ -1037,9 +1233,43 @@ class TrashReportBot {
               photo = matchingMsg?.photo || [...pending.messages].reverse().find(m => m.photo)?.photo || null;
             }
 
+            // For vehiculo_mal_estacionado, collect photos that belong to THIS report only
+            // Stop before the next vehicle's msgIndex to avoid mixing photos
+            if (req.reportType === 'vehiculo_mal_estacionado') {
+              photos = [];
+              const startIdx = primaryMsgIndex !== null ? primaryMsgIndex : 0;
+
+              // Find where the NEXT vehicle starts (so we don't take its photos)
+              const nextVehicleIdx = vehicleMsgIndexes.find(idx => idx > (req.msgIndex || 1));
+              const endIdx = nextVehicleIdx ? nextVehicleIdx - 1 : pending.messages.length;
+
+              for (let i = startIdx; i < endIdx; i++) {
+                const msg = pending.messages[i];
+                if (!msg.photo) continue;
+
+                if (i === startIdx) {
+                  // Always include the primary photo
+                  photos.push(msg.photo);
+                } else if (!msg.text || msg.text.trim() === '') {
+                  // Include photos without text (likely continuation of same vehicle)
+                  photos.push(msg.photo);
+                } else {
+                  // Photo has different text - might be a different report, stop collecting
+                  break;
+                }
+              }
+              console.log(`  [Vehicle] Collected ${photos.length} photo(s) for ${req.patente} at ${req.address} (msgs ${startIdx + 1}-${endIdx})`);
+            }
+
             // Mark as queued with normalized key
             recentlyQueuedAddresses.set(addrKey, Date.now());
             console.log(`  [Dedup] Added ${req.address} (key: ${addrKey}) to dedup map`);
+
+            // Use Claude's determination for postToX (per-request, not global)
+            const shouldPostToX = req.postToX === true;
+            if (shouldPostToX) {
+              console.log(`  [X] Request marked for X/Twitter posting: ${req.address}`);
+            }
 
             requestQueue.push({
               senderId,
@@ -1072,6 +1302,42 @@ class TrashReportBot {
         }
         for (const dupe of duplicates) {
           console.log(`    - ${dupe.address} (DUPLICADO - #${dupe.solicitudNumber})`);
+        }
+
+        // After queueing other requests, start vehicle patente confirmation if any
+        if (vehiclePatenteQueue.has(senderId) && vehiclePatenteQueue.get(senderId).length > 0) {
+          const vehicles = vehiclePatenteQueue.get(senderId);
+          const firstVehicle = vehicles[0];
+
+          let question = '';
+          if (firstVehicle.missingField === 'photos') {
+            question = `Para reportar un vehículo mal estacionado necesito dos fotos: una de la infracción y otra de la patente. ¿Podés mandar la otra foto?`;
+          } else if (firstVehicle.missingField === 'patente') {
+            question = `No puedo leer la patente en las fotos. ¿Podés decirme cuál es la patente del vehículo? (ej: ABC123 o AB123CD)`;
+          } else if (firstVehicle.missingField === 'infractionTime') {
+            question = `¿A qué hora viste el vehículo mal estacionado en ${firstVehicle.address}? (ej: 14:30)`;
+          } else if (firstVehicle.missingField === 'patenteConfirmation') {
+            const queueInfo = vehicles.length > 1 ? ` (1 de ${vehicles.length} vehículos)` : '';
+            question = `Leí la patente como ${firstVehicle.patente}. ¿Es correcta?${queueInfo} (respondé "si" o la patente correcta)`;
+          }
+
+          const messageOptions = { mentions };
+          if (firstVehicle.photoMsgId) {
+            messageOptions.quotedMessageId = firstVehicle.photoMsgId;
+          }
+
+          console.log(`  [Vehicle] Starting patente confirmation for ${firstVehicle.patente} at ${firstVehicle.address}`);
+          await chat.sendMessage(`${mentionText} ${question}`.trim(), messageOptions);
+
+          // Save as pending info request
+          if (!this.pendingInfoRequests) {
+            this.pendingInfoRequests = new Map();
+          }
+          this.pendingInfoRequests.set(senderId, {
+            ...firstVehicle,
+            awaitingField: firstVehicle.missingField,
+            awaitingQuestion: question
+          });
         }
 
         // Clear pending messages for this user
@@ -1503,13 +1769,44 @@ Respondé SOLO con la dirección limpia, nada más.`,
     if (reportType === 'vehiculo_mal_estacionado') {
       if (request.patente) console.log(`  Patente: ${request.patente}`);
       if (request.infractionTime) console.log(`  Hora infracción: ${request.infractionTime}`);
+      if (multiplePhotos && multiplePhotos.length > 0) {
+        console.log(`  Fotos: ${multiplePhotos.length} (${multiplePhotos.map(p => p.split('/').pop()).join(', ')})`);
+      } else if (photo) {
+        console.log(`  Fotos: 1 (${photo.split('/').pop()})`);
+      }
     }
     console.log('========================================\n');
 
     try {
-      // Call the API
-      // For vehiculo_mal_estacionado, use multiplePhotos if available
+      // For vehiculo_mal_estacionado, require at least 2 photos
       const photosToSend = multiplePhotos && multiplePhotos.length > 0 ? multiplePhotos : (photo ? [photo] : []);
+
+      if (reportType === 'vehiculo_mal_estacionado' && photosToSend.length < 2) {
+        console.log(`  [API] ⚠️ Vehicle report requires 2 photos, only have ${photosToSend.length}. Asking for more.`);
+
+        // Notify user and set up pending request for more photos
+        const question = `Para reportar un vehículo mal estacionado necesito dos fotos: una de la infracción y otra de la patente. ¿Podés mandar la otra foto?`;
+        await chat.sendMessage(`${mentionText} ${question}`, { mentions });
+
+        if (!this.pendingInfoRequests) {
+          this.pendingInfoRequests = new Map();
+        }
+        this.pendingInfoRequests.set(senderId, {
+          senderId,
+          senderName,
+          address,
+          photos: photosToSend,
+          chat,
+          reportType: 'vehiculo_mal_estacionado',
+          patente: patente || null,
+          infractionTime: infractionTime || null,
+          awaitingField: 'photo',
+          postToX: shouldPostToX
+        });
+        return;
+      }
+
+      console.log(`  [API] Sending ${photosToSend.length} photo(s) to API`);
       const response = await fetch(`${API_URL}/solicitud`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1531,11 +1828,13 @@ Respondé SOLO con la dirección limpia, nada más.`,
         // Format solicitud number for URL (replace / with &)
         const solicitudUrl = `https://bacolaborativa.buenosaires.gob.ar/detalleSolicitud/${result.solicitudNumber.replace(/\//g, '&')}?vieneDeMisSolicitudes=false`;
 
-        // Log to CSV file (with reportType for per-type deduplication)
+        // Log to CSV file (with reportType for per-type deduplication, and patente for vehicles)
         const today = new Date();
         const dateStr = `${today.getDate().toString().padStart(2, '0')}/${(today.getMonth() + 1).toString().padStart(2, '0')}/${today.getFullYear()}`;
         const timestamp = Date.now();
-        const csvLine = `${result.solicitudNumber},${dateStr},"${address}",${reportType},${solicitudUrl},${timestamp}\n`;
+        // Include patente for vehicle reports (allows multiple vehicles at same address)
+        const patenteField = reportType === 'vehiculo_mal_estacionado' && patente ? patente.toUpperCase() : '';
+        const csvLine = `${result.solicitudNumber},${dateStr},"${address}",${reportType},${patenteField},${solicitudUrl},${timestamp}\n`;
         fs.appendFileSync(REPORTS_LOG, csvLine);
         console.log(`  [Log] Guardado en reports.csv (${reportType})`);
 
@@ -1564,8 +1863,13 @@ Respondé SOLO con la dirección limpia, nada más.`,
           }
         }
 
-        // Clean up photo after successful submission and X posting
-        if (photo) {
+        // Clean up photos after successful submission and X posting
+        // For vehicle reports, clean up all photos in the array
+        if (multiplePhotos && multiplePhotos.length > 0) {
+          for (const p of multiplePhotos) {
+            try { fs.unlinkSync(p); } catch (e) {}
+          }
+        } else if (photo) {
           try { fs.unlinkSync(photo); } catch (e) {}
         }
       } else if (result.success) {
@@ -1826,9 +2130,10 @@ Respondé SOLO con la dirección limpia, nada más.`,
       const lines = content.split('\n').slice(1); // Skip header
       for (const line of lines) {
         if (line.trim()) {
-          // Extract address from CSV line (handles both old and new format)
+          // Extract address from CSV line (handles multiple formats)
           // Old format: numero,fecha,"direccion",link,timestamp
-          // New format: numero,fecha,"direccion",reportType,link,timestamp
+          // Previous format: numero,fecha,"direccion",reportType,link,timestamp
+          // Current format: numero,fecha,"direccion",reportType,patente,link,timestamp
           const addressMatch = line.match(/"([^"]+)"/);
           const parts = line.split(',');
           const timestamp = parseInt(parts[parts.length - 1]) || 0;
@@ -1840,14 +2145,24 @@ Respondé SOLO con la dirección limpia, nada más.`,
             // Detect format: if part after address is a known reportType, use new format
             // Find index of closing quote, then check next part
             const quoteEnd = line.indexOf('"', line.indexOf('"') + 1);
-            const afterAddress = line.substring(quoteEnd + 2).split(',')[0];
-            const knownTypes = ['recoleccion', 'barrido', 'obstruccion', 'ocupacion_comercial', 'ocupacion_gastronomica', 'manteros'];
-            const reportType = knownTypes.includes(afterAddress) ? afterAddress : 'recoleccion';
+            const afterQuote = line.substring(quoteEnd + 2).split(',');
+            const knownTypes = ['recoleccion', 'barrido', 'obstruccion', 'ocupacion_comercial', 'ocupacion_gastronomica', 'manteros', 'puesto_diarios', 'puesto_flores', 'vehiculo_mal_estacionado'];
+            const reportType = knownTypes.includes(afterQuote[0]) ? afterQuote[0] : 'recoleccion';
 
-            // Key: normalized_address|reportType
-            const key = `${address}|${reportType}`;
+            // For vehicle reports, check if there's a patente field (5th field after address)
+            // Format: reportType,patente,link,timestamp - so patente is afterQuote[1] if it's not a URL
+            let patente = null;
+            if (reportType === 'vehiculo_mal_estacionado' && afterQuote[1] && !afterQuote[1].startsWith('http')) {
+              patente = afterQuote[1].toUpperCase();
+            }
 
-            // Keep the most recent entry for each address+reportType combo
+            // Key: normalized_address|reportType or normalized_address|reportType|PATENTE for vehicles
+            let key = `${address}|${reportType}`;
+            if (patente) {
+              key = `${key}|${patente}`;
+            }
+
+            // Keep the most recent entry for each address+reportType+patente combo
             if (!processed.has(key) || processed.get(key).timestamp < timestamp) {
               processed.set(key, { timestamp, solicitudNumber });
             }
@@ -1882,16 +2197,26 @@ Respondé SOLO con la dirección limpia, nada más.`,
     return normalized;
   }
 
-  // Check if address+reportType was submitted in last 12 hours
-  isRecentDuplicate(address, reportType, processedMap) {
+  // Check if address+reportType (and patente for vehicles) was submitted in last 12 hours
+  isRecentDuplicate(address, reportType, processedMap, patente = null) {
     const normalizedNew = this.normalizeAddressForComparison(address);
     const type = reportType || 'recoleccion';
 
     // Check against all processed addresses (normalized) with matching reportType
     for (const [storedKey, entry] of processedMap) {
-      // Key format: "normalized_address|reportType"
-      const [storedAddr, storedType] = storedKey.split('|');
+      // Key format: "normalized_address|reportType" or "normalized_address|reportType|PATENTE" for vehicles
+      const parts = storedKey.split('|');
+      const storedAddr = parts[0];
+      const storedType = parts[1];
+      const storedPatente = parts[2] || null;
+
       if (normalizedNew === storedAddr && type === storedType) {
+        // For vehicle reports, also check patente - different patentes are different reports
+        if (type === 'vehiculo_mal_estacionado' && patente && storedPatente) {
+          if (patente.toUpperCase() !== storedPatente.toUpperCase()) {
+            continue; // Different vehicle, not a duplicate
+          }
+        }
         const twelveHoursAgo = Date.now() - (12 * 60 * 60 * 1000);
         if (entry.timestamp > twelveHoursAgo) {
           return entry;
@@ -1940,7 +2265,8 @@ Respondé SOLO con la dirección limpia, nada más.`,
           photo: null,
           timestamp: new Date(msgTime),
           isBot: msg.fromMe,
-          senderId
+          senderId,
+          msgId: msg.id?._serialized || null  // Store for quote replies
         };
 
         // Download photo if present (only for user messages)
@@ -2026,17 +2352,20 @@ Respondé SOLO con la dirección limpia, nada más.`,
             // Get sender info for mention
             const senderPhone = senderId.split('@')[0];
             const mentionText = `@${senderPhone}`;
-            await targetChat.sendMessage(`${mentionText} ${extraction.response}`.trim(), { mentions: [senderId] });
-            console.log(`[Startup] Sent message to ${senderPhone}: ${extraction.response}`);
+            // Find a photo message to quote (most relevant context)
+            const photoMsg = userData.messages.find(m => m.photo && m.msgId);
+            const messageOptions = { mentions: [senderId] };
+            if (photoMsg?.msgId) {
+              messageOptions.quotedMessageId = photoMsg.msgId;
+            }
+            await targetChat.sendMessage(`${mentionText} ${extraction.response}`.trim(), messageOptions);
+            console.log(`[Startup] Sent message to ${senderPhone}: ${extraction.response}${photoMsg?.msgId ? ' (quoted)' : ''}`);
           } catch (e) {
             console.log(`[Startup] Error sending message: ${e.message}`);
           }
         }
 
         if (extraction.requests && extraction.requests.length > 0) {
-          // Check if user requested posting to X/Twitter
-          const shouldPostToX = this.shouldPostToX(userData.messages);
-
           // Helper to validate addresses
           const isValidAddress = (address) => {
             if (!address || typeof address !== 'string') return false;
@@ -2050,14 +2379,20 @@ Respondé SOLO con la dirección limpia, nada más.`,
             return true;
           };
 
+          // Get all vehicle request msgIndex values to know boundaries
+          const vehicleMsgIndexes = extraction.requests
+            .filter(r => r.reportType === 'vehiculo_mal_estacionado' && r.msgIndex)
+            .map(r => r.msgIndex)
+            .sort((a, b) => a - b);
+
           for (const req of extraction.requests) {
             // Skip if no address or invalid address
             if (!isValidAddress(req.address)) {
               console.log(`[Startup] Invalid/missing address, ignorando: "${req.address}"`);
               continue;
             }
-            // Skip if already processed in last 12 hours (per address + report type)
-            const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses);
+            // Skip if already processed in last 12 hours (per address + report type + patente for vehicles)
+            const recentDupe = this.isRecentDuplicate(req.address, req.reportType, processedAddresses, req.patente);
             if (recentDupe) {
               console.log(`[Startup] Ya procesado en últimas 12h: ${req.address} [${req.reportType || 'recoleccion'}] (#${recentDupe.solicitudNumber})`);
               continue;
@@ -2072,26 +2407,152 @@ Respondé SOLO con la dirección limpia, nada más.`,
             }
 
             // Add to in-memory dedup map to prevent duplicate queuing
-            const addrKey = this.normalizeAddressForComparison(req.address);
+            // For vehicle reports, include patente in the key
+            let addrKey = this.normalizeAddressForComparison(req.address);
+            if (req.reportType === 'vehiculo_mal_estacionado' && req.patente) {
+              addrKey = `${addrKey}|${req.patente.toUpperCase()}`;
+            }
             recentlyQueuedAddresses.set(addrKey, Date.now());
 
             console.log(`[Startup] Encontrado pendiente: ${req.address} (key: ${addrKey})`);
-            requestQueue.push({
-              senderId,
-              senderName,
-              address: req.address,
-              reportType: req.reportType || 'recoleccion',
-              containerType: req.containerType || 'negro',
-              schedule: req.schedule || null,
-              photo,
-              chat: targetChat,
-              postToX: shouldPostToX
-            });
+
+            // For vehicle reports, collect photos that belong to THIS specific vehicle
+            // Use msgIndex to identify the starting photo, and stop before the next vehicle's msgIndex
+            let photos = null;
+            let primaryPhotoMsgId = null;  // For quoting the original message
+            if (req.reportType === 'vehiculo_mal_estacionado') {
+              const startIdx = req.msgIndex ? req.msgIndex - 1 : 0;
+              photos = [];
+
+              // Find where the NEXT vehicle starts (so we don't take its photos)
+              const nextVehicleIdx = vehicleMsgIndexes.find(idx => idx > (req.msgIndex || 1));
+              const endIdx = nextVehicleIdx ? nextVehicleIdx - 1 : userData.messages.length;
+
+              console.log(`[Startup] Vehicle ${req.patente}: msgs ${startIdx + 1} to ${endIdx} (next vehicle at msg ${nextVehicleIdx || 'none'})`);
+
+              for (let i = startIdx; i < endIdx; i++) {
+                const msg = userData.messages[i];
+                if (!msg.photo) continue;
+
+                if (i === startIdx) {
+                  // Always include the primary photo
+                  photos.push(msg.photo);
+                  primaryPhotoMsgId = msg.msgId;  // Store msgId for quoting
+                  console.log(`[Startup]   Including primary: ${msg.photo.split('/').pop()} (msgId: ${msg.msgId ? 'yes' : 'no'})`);
+                } else if (!msg.text || msg.text.trim() === '') {
+                  // Include photos without text (continuation of same vehicle)
+                  photos.push(msg.photo);
+                  console.log(`[Startup]   Including continuation: ${msg.photo.split('/').pop()}`);
+                } else {
+                  // Photo has text - might be a different report, stop
+                  console.log(`[Startup]   Stopping at msg ${i + 1} (has text: "${msg.text}")`);
+                  break;
+                }
+              }
+
+              console.log(`[Startup] Vehicle ${req.patente}: collected ${photos.length} photo(s)`);
+
+              // Vehicle reports require at least 2 photos (infraction + patente)
+              if (photos.length < 2) {
+                console.log(`[Startup] ⚠️ Vehicle ${req.patente} only has ${photos.length} photo(s), need at least 2`);
+              }
+            }
+
+            // Use Claude's per-request determination for postToX
+            const shouldPostToX = req.postToX === true;
+
+            // For vehicle reports, need to confirm patente before submission
+            if (req.reportType === 'vehiculo_mal_estacionado' && req.patente) {
+              // Determine what's missing - photos take priority over patente confirmation
+              const effectiveMissingField = (photos && photos.length >= 2) ? 'patenteConfirmation' : 'photos';
+
+              const vehicleReport = {
+                address: req.address,
+                reportType: 'vehiculo_mal_estacionado',
+                patente: req.patente,
+                infractionTime: req.infractionTime || null,
+                photo: photo,
+                photos: photos,
+                msgIndex: req.msgIndex,
+                postToX: shouldPostToX,
+                senderId: senderId,
+                senderName: senderName,
+                chat: targetChat,
+                photoMsgId: primaryPhotoMsgId,  // For quoting the original message
+                missingField: effectiveMissingField
+              };
+
+              // Add to vehicle patente queue
+              if (!vehiclePatenteQueue.has(senderId)) {
+                vehiclePatenteQueue.set(senderId, []);
+              }
+              vehiclePatenteQueue.get(senderId).push(vehicleReport);
+              console.log(`[Startup] Queued vehicle ${req.patente} for patente confirmation (${vehiclePatenteQueue.get(senderId).length} in queue)`);
+            } else {
+              // Non-vehicle reports go directly to queue
+              requestQueue.push({
+                senderId,
+                senderName,
+                address: req.address,
+                reportType: req.reportType || 'recoleccion',
+                containerType: req.containerType || 'negro',
+                schedule: req.schedule || null,
+                patente: req.patente || null, // For vehiculo_mal_estacionado
+                infractionTime: req.infractionTime || null, // For vehiculo_mal_estacionado
+                photo,
+                photos, // For vehiculo_mal_estacionado: multiple photos
+                chat: targetChat,
+                postToX: shouldPostToX
+              });
+            }
           }
         }
 
         // Small delay to avoid rate limiting
         await this.delay(1000);
+      }
+
+      // Process vehicle patente confirmation queue - ask about first vehicle for each sender
+      for (const [senderId, vehicles] of vehiclePatenteQueue) {
+        if (vehicles.length === 0) continue;
+
+        const firstVehicle = vehicles[0];
+        const missingField = firstVehicle.missingField || 'patenteConfirmation';
+        console.log(`[Startup] Setting up ${missingField} for ${firstVehicle.patente} (${vehicles.length} vehicles queued for ${senderId.split('@')[0]})`);
+
+        // Set up pending info request for the first vehicle
+        if (!this.pendingInfoRequests) {
+          this.pendingInfoRequests = new Map();
+        }
+
+        this.pendingInfoRequests.set(senderId, {
+          ...firstVehicle,
+          awaitingField: missingField,
+          timestamp: Date.now()
+        });
+
+        // Ask the appropriate question based on what's missing
+        try {
+          const senderPhone = senderId.split('@')[0];
+          const mentionText = `@${senderPhone}`;
+          const queueInfo = vehicles.length > 1 ? ` (1 de ${vehicles.length} vehículos)` : '';
+
+          let question;
+          if (missingField === 'photos') {
+            question = `Para reportar el vehículo mal estacionado en ${firstVehicle.address} necesito dos fotos: una de la infracción y otra de la patente.${queueInfo} ¿Podés mandar la otra foto?`;
+          } else {
+            question = `Leí la patente como ${firstVehicle.patente}. ¿Es correcta?${queueInfo} (respondé "si" o la patente correcta)`;
+          }
+
+          const messageOptions = { mentions: [senderId] };
+          if (firstVehicle.photoMsgId) {
+            messageOptions.quotedMessageId = firstVehicle.photoMsgId;
+          }
+          await firstVehicle.chat.sendMessage(`${mentionText} ${question}`, messageOptions);
+          console.log(`[Startup] Asked ${missingField} for ${firstVehicle.patente} to ${senderPhone}${firstVehicle.photoMsgId ? ' (quoted)' : ''}`);
+        } catch (e) {
+          console.log(`[Startup] Error sending ${missingField} question: ${e.message}`);
+        }
       }
 
       if (requestQueue.length > 0) {

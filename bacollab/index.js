@@ -402,13 +402,19 @@ async function analyzeAndFillForm(page, availableData) {
   const isPatenteQuestion = formContext.questionLabel.toLowerCase().includes('patente') ||
                             formContext.questionLabel.toLowerCase().includes('chapa') ||
                             formContext.fullText.toLowerCase().includes('patente del vehículo');
-  if (isPatenteQuestion && formContext.hasTextarea && formContext.textareaEmpty && patente) {
-    console.log(`[Form AI] DECISION: Patente question detected, filling with "${patente}"`);
-    return {
-      action: 'fill_textarea',
-      value: patente,
-      then: 'click_siguiente'
-    };
+  if (isPatenteQuestion && formContext.hasTextarea && formContext.textareaEmpty) {
+    if (patente) {
+      console.log(`[Form AI] DECISION: Patente question detected, filling with "${patente}"`);
+      return {
+        action: 'fill_textarea',
+        value: patente,
+        then: 'click_siguiente'
+      };
+    } else {
+      // Patente question but no patente provided - abort form submission
+      console.log('[Form AI] ERROR: Patente question detected but patente not provided, aborting');
+      return { action: 'error', message: 'Patente no proporcionada - el formulario requiere la patente del vehículo' };
+    }
   }
 
   // Case 0d: Vehicle date input question
@@ -481,6 +487,15 @@ async function analyzeAndFillForm(page, availableData) {
     console.log('[Form AI] WARNING: Siguiente disabled, checking what needs to be filled...');
     // Try to fill whatever is empty
     if (formContext.hasTextarea && formContext.textareaEmpty) {
+      // Check if this is a patente question - don't fill with "No especificado"
+      if (isPatenteQuestion) {
+        if (patente) {
+          return { action: 'fill_textarea', value: patente, then: 'wait' };
+        } else {
+          console.log('[Form AI] ERROR: Patente question detected but patente not provided');
+          return { action: 'error', message: 'Patente no proporcionada - el formulario requiere la patente del vehículo' };
+        }
+      }
       return { action: 'fill_textarea', value: schedule || 'No especificado', then: 'wait' };
     }
     if (formContext.hasRadio && !formContext.radioSelected) {
@@ -2685,10 +2700,14 @@ function normalizeAddressForDedup(address) {
     .trim();
 }
 
-// Create dedup key combining address and report type
-function createDedupKey(address, reportType) {
+// Create dedup key combining address, report type, and patente (for vehicles)
+function createDedupKey(address, reportType, patente = null) {
   const normalizedAddr = normalizeAddressForDedup(address);
   const type = reportType || 'recoleccion';
+  // For vehicle reports, include patente so different vehicles at same address aren't blocked
+  if (type === 'vehiculo_mal_estacionado' && patente) {
+    return `${normalizedAddr}|${type}|${patente.toUpperCase()}`;
+  }
   return `${normalizedAddr}|${type}`;
 }
 
@@ -2706,11 +2725,12 @@ app.post('/solicitud', async (req, res) => {
   if (infractionTime) logMsg += `, infractionTime="${infractionTime}"`;
   console.log(logMsg);
 
-  // Deduplication check - prevent submitting same address+reportType twice
-  const dedupKey = createDedupKey(address, reportType);
+  // Deduplication check - prevent submitting same address+reportType+patente twice
+  const dedupKey = createDedupKey(address, reportType, patente);
   const recent = recentSubmissions.get(dedupKey);
   if (recent && (Date.now() - recent.timestamp) < SUBMISSION_DEDUP_MS) {
-    console.log(`[DEDUP] Blocking duplicate submission for "${address}" [${reportType || 'recoleccion'}] (submitted ${Math.round((Date.now() - recent.timestamp) / 1000)}s ago as #${recent.solicitudNumber})`);
+    const patenteInfo = patente ? ` patente=${patente}` : '';
+    console.log(`[DEDUP] Blocking duplicate submission for "${address}" [${reportType || 'recoleccion'}]${patenteInfo} (submitted ${Math.round((Date.now() - recent.timestamp) / 1000)}s ago as #${recent.solicitudNumber})`);
     return res.json({
       success: true,
       solicitudNumber: recent.solicitudNumber,
@@ -2774,12 +2794,19 @@ app.post('/solicitud', async (req, res) => {
       // Close browser before retry or final failure
       await closeBrowser();
 
-      // Only retry for specific errors that might be fixed by a fresh session
+      // Retry for errors that might be fixed by a fresh session
       const isAddressError = error.message.includes('No address suggestions found') ||
                              error.message.includes('Address input not found');
+      const isBrowserError = error.message.includes('detached') ||
+                             error.message.includes('Execution context was destroyed') ||
+                             error.message.includes('Target closed') ||
+                             error.message.includes('Protocol error') ||
+                             error.message.includes('Session closed') ||
+                             error.message.includes('frame was detached') ||
+                             error.message.includes('Navigating frame');
 
-      if (attempt < maxAttempts && isAddressError) {
-        console.log('Retrying with fresh browser session...');
+      if (attempt < maxAttempts && (isAddressError || isBrowserError)) {
+        console.log(`Retrying with fresh browser session (error type: ${isBrowserError ? 'browser' : 'address'})...`);
         await new Promise(r => setTimeout(r, 3000)); // Longer delay before retry
       } else {
         // Improve error message for address-related errors
